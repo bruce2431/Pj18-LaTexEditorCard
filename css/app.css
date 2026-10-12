@@ -1,7 +1,7 @@
 /* ============================================================
-   Floria LaTeX v2 — 两界面（目录页 + 纯 PDF 编辑页）
+   Floria LaTeX v2 — 单界面（纯 PDF 预览卡；无目录页）
    纯黑白极简、无彩色；token 沿用旧版（--plane / --radius / --gap）
-   目录页观感照 Pj13 Catalog（结构与数值），编辑页照 Prism（PDF 为主体）
+   观感照 Prism（PDF 为主体）；打开哪篇由宿主广播 / 卡片命令驱动
    ============================================================ */
 :root {
   --bg: #FFFFFF;
@@ -41,72 +41,26 @@ body {
 button { font-family: inherit; cursor: pointer; }
 
 /* ---------- 通用小件 ---------- */
-.btn {
-  border: 1px solid var(--border);
-  background: var(--panel);
-  color: var(--ink);
-  border-radius: 9px;
-  padding: 7px 14px;
-  font-size: 13px;
-}
-.btn:hover { border-color: var(--border-strong); background: var(--accent-soft); }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-.btn.primary:hover { background: var(--accent-deep); border-color: var(--accent-deep); }
-.btn.ghost { background: transparent; }
-.btn.slim { padding: 5px 11px; font-size: 12.5px; border-radius: 999px; }
 .icon-btn {
   width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
   border: 1px solid transparent; background: transparent; color: var(--ink-soft); border-radius: 8px;
 }
 .icon-btn:hover { background: var(--accent-soft); color: var(--ink); }
-.brand-mark {
-  width: 28px; height: 28px; border-radius: 9px; background: var(--accent); color: var(--accent-fg);
-  display: flex; align-items: center; justify-content: center;
-  font-family: var(--serif); font-size: 16px; font-weight: 600; flex: 0 0 auto;
-}
 
 /* ============================================================
-   一、目录页
-   ============================================================ */
-#view-catalog { height: 100%; display: flex; flex-direction: column; background: var(--bg); }
-.topbar {
-  flex: 0 0 auto; height: 48px; display: flex; align-items: center; justify-content: space-between;
-  gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--border);
-}
-.tb-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.tb-title { font-size: 13.5px; font-weight: 600; white-space: nowrap; }
-.tb-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-
-.cat-scroll { flex: 1; overflow: auto; }
-/* Pj13 数值：padding 18/16/40 + 内容 max-width 980 居中 */
-.cat { padding: 18px 16px 40px; max-width: 980px; margin: 0 auto; }
-.cat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 0 4px 10px; }
-.cat-title { font-family: var(--serif); font-size: 17px; font-weight: 600; letter-spacing: .2px; }
-.cat-count { font-size: 12px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
-
-.cat-list { display: flex; flex-direction: column; }
-.cat-row {
-  width: 100%; text-align: left; display: flex; align-items: center; gap: 10px;
-  padding: 10px 12px; border: none; border-bottom: 1px solid var(--border-soft);
-  background: transparent; color: var(--ink); border-radius: 8px;
-}
-.cat-row:first-child { border-top: 1px solid var(--border-soft); }
-.cat-row:hover { background: var(--hover); }
-.cat-icon { display: flex; color: var(--ink-faint); flex: 0 0 auto; }
-.cat-row:hover .cat-icon { color: var(--ink-soft); }
-.cat-name { font-size: 13.5px; font-weight: 600; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cat-meta { font-size: 12px; color: var(--ink-faint); font-variant-numeric: tabular-nums; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cat-arrow { color: var(--ink-faint); font-size: 15px; flex: 0 0 auto; }
-
-.cat-state { padding: 34px 12px; text-align: center; }
-.cat-state .cs-title { font-size: 13.5px; font-weight: 600; margin-bottom: 6px; }
-.cat-state .cs-hint { font-size: 12.5px; color: var(--ink-faint); line-height: 1.7; }
-.cat-state.err .cs-title { color: var(--ink); }
-
-/* ============================================================
-   二、编辑页（满屏 PDF）
+   唯一视图：满屏 PDF（无目录页）
    ============================================================ */
 #view-viewer { position: fixed; inset: 0; background: var(--desk); }
+
+/* 空态：没有任何书稿被打开时铺在视图区（PDF 页一渲出来就被 #pdf-pages 盖住，无需显隐） */
+#view-empty {
+  position: absolute; top: 48px; left: 0; right: 0; bottom: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 24px; text-align: center; background: var(--desk); z-index: 0;
+  pointer-events: none;
+}
+#view-empty .ve-title { font-family: var(--serif); font-size: 16px; font-weight: 600; color: var(--ink-soft); }
+#view-empty .ve-hint { font-size: 12.5px; color: var(--ink-faint); line-height: 1.7; max-width: 320px; }
 
 /* PDF 井从顶栏下沿开始（顶栏是通栏实体条，PDF 不从它底下穿过） */
 #pdf-scroll {
@@ -200,6 +154,49 @@ button { font-family: inherit; cursor: pointer; }
 }
 .pv-caps button:hover { background: var(--accent-soft); color: var(--accent-deep); }
 #pdf-page-ind { font-size: 12px; min-width: 64px; text-align: center; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+
+/* ---------- 目录抽屉（PDF 自带书签，Edge 式章节跳转） ---------- */
+/* 入口按钮浮在 PDF 左上角（不动顶栏那三枚按钮）；抽屉盖在 PDF 井上，井不重排（PDF 不因此重渲染） */
+#toc-toggle {
+  position: absolute; left: 10px; top: 58px; z-index: 13;
+  width: 30px; height: 30px; display: flex; align-items: center; justify-content: center;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 9px;
+  color: var(--ink-soft); box-shadow: var(--shadow);
+}
+#toc-toggle:hover { color: var(--ink); border-color: var(--border-strong); background: var(--accent-soft); }
+#toc-drawer {
+  position: absolute; top: 48px; left: 0; bottom: 0; width: 264px; z-index: 13;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--panel); border-right: 1px solid var(--border);
+}
+.toc-head {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 12px 10px 8px 16px; border-bottom: 1px solid var(--border-soft);
+}
+.toc-title { font-size: 13px; font-weight: 600; }
+.toc-body { flex: 1; overflow: auto; padding: 8px 8px 20px; }
+/* 树形列表行（缩进表层级），不是小卡 */
+.toc-item {
+  display: flex; align-items: baseline; gap: 8px;
+  width: 100%; text-align: left; border: none; background: none;
+  padding: 5px 8px; border-radius: 6px; font-size: 12.5px; line-height: 1.45;
+  color: var(--ink-soft);
+}
+/* 长标题省略、页码恒贴右（float 写法遇长标题会把页码挤到下一行） */
+.toc-t { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toc-item:hover { background: var(--hover); color: var(--ink); }
+.toc-item.on { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
+.toc-item.off { opacity: .45; }        /* 解析不出目标页的条目：列出但不可点 */
+.toc-item.lv1 { color: var(--ink); font-weight: 600; }
+.toc-item.lv2 { padding-left: 22px; }
+.toc-item.lv3 { padding-left: 36px; }
+.toc-item.lv4 { padding-left: 50px; }
+.toc-pg { flex: 0 0 auto; color: var(--ink-faint); font-variant-numeric: tabular-nums; font-weight: 400; }
+
+/* PDF 内链（Link 注释铺成的可点层，见 js/pdfview.js attachLinks） */
+.pv-links { position: absolute; inset: 0; }
+.pv-link { position: absolute; display: block; border-radius: 2px; cursor: pointer; box-sizing: border-box; }
+.pv-link:hover { background: rgba(17, 17, 17, .07); }
 
 /* ---------- 工具面板（版本 / 日志） ---------- */
 /* 展开 = **占满整块视图区**（照 Floria work 右栏自带的那枚「评论」工具页：工具页就是一整列）。

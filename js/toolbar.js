@@ -57,7 +57,8 @@
   }
 
   /* ---------------- 宿主桥：工具注册到 Floria「工具栏」面板 ----------------
-     本页跑在 /backend/<label>/ 反代 iframe 里时，把工具表申报给宿主工具栏（Floria work 右栏的
+     本页跑在宿主的预览帧（iframe，本机 = 127.0.0.1:<port> 直连 / 远程 = /backend/<label>/ 反代）里时，
+     把工具表申报给宿主工具栏（Floria work 右栏的
      「工具栏」面板）：`{type:'floria-wk-tool-register', tools:[{id,title}]}`（**整份替换**，不送 pane）。
      宿主渲 tab 条、**保预览帧在场**（帧工具的内容归本页自管），点 tab 回 `floria-wk-tool-select{id}`
      （`''` = 回到默认/预览态）→ 本页切 pane（CustomEvent 'floria:tool-select'，viewer.js 接）。
@@ -65,7 +66,9 @@
      tab 的落点（`#tool-tabs` 清空），tab 只长在宿主工具栏上。
      未桥接时（单开 / `file://` / 旧宿主）hosted 恒 false → 本页自渲 tab（落在工具面板卡头；
      顶栏只有三枚按钮，面板不开则 tab 不可见——非桥接下唯一的面板入口是编译失败自动摊开）。 */
-  const EMBEDDED = window.parent !== window && location.pathname.indexOf('/backend/') === 0;
+  // 帧内判据唯一一份 = js/bridge.js（此前本文件自己写「parent !== window 且 pathname 以 /backend/ 开头」，
+  // 而本机宿主走 http://127.0.0.1:<port>/ 直连、pathname 是 '/' ⇒ 恒判为未桥接，申报根本发不出去）。
+  const EMBEDDED = F.bridge.embedded();
   let hosted = false;
 
   function setHosted(on) {

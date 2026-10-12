@@ -148,6 +148,7 @@
       return task.promise.then(() => {
         if (mySeq !== seq || disposed) return;
         pg.rendered = true; pg.rendering = null; pg.task = null;
+        attachLinks(pg, page, s);          // 链接层随 canvas 一起铺（缩放重建 canvas 时会一并重铺）
       });
     }).catch(err => {
       if (mySeq === seq && !disposed && err && err.name !== 'RenderingCancelledException') {
@@ -171,6 +172,7 @@
       pg.rendering = null; pg.task = null;
       pg.rendered = false; pg.dirty = false;
       if (pg.canvas) { pg.canvas.remove(); pg.canvas = null; }
+      if (pg.links) { pg.links.remove(); pg.links = null; }   // 链接层坐标随缩放失效，一并丢弃
       sizePage(pg, scaleOf(pg.w, pg.h));
     });
     if (observer) { observer.disconnect(); observePages(); }
@@ -267,6 +269,7 @@
       if (Math.abs(e.clientX - downX) > 6 || Math.abs(e.clientY - downY) > 6) moved = true;
     });
     holder.addEventListener('pointerup', e => {
+      if (e.target.closest && e.target.closest('.pv-link')) return;   // 点在链接上 = 链接的事，不跳源码
       const tgt = e.target.closest ? e.target.closest('.pv-page') : null;
       if (!onPick || moved || !el || tgt !== el) return;
       const pg = pages[+el.dataset.n - 1];
@@ -276,6 +279,73 @@
       const y = (e.clientY - r.top) * pg.h / r.height;
       onPick(+el.dataset.n, x, y);
     });
+  }
+
+  /* ---------------- PDF 内链（超链接注释） ----------------
+   页面上的链接是 PDF 的 Link 注释，不画在 canvas 里——自绘查看器必须自己铺一层可点区域，
+   否则目录页/交叉引用/\cite 那些框看着像链接、点下去只会触发「跳源码」。
+   坐标：注释 rect 是 PDF 用户空间（原点右下），经 viewport 换算成页面元素内的左上原点像素。 */
+  function attachLinks(pg, page, s) {
+    if (pg.links) { pg.links.remove(); pg.links = null; }
+    const mySeq = seq;
+    return page.getAnnotations({ intent: 'display' }).then(annots => {
+      if (mySeq !== seq || disposed) return;
+      const links = annots.filter(a => a.subtype === 'Link' && a.rect);
+      if (!links.length) return;
+      const vp = page.getViewport({ scale: s });
+      const layer = document.createElement('div');
+      layer.className = 'pv-links';
+      links.forEach(a => {
+        const r = vp.convertToViewportRectangle(a.rect);      // [x1,y1,x2,y2]
+        const el = document.createElement('a');
+        el.className = 'pv-link';
+        el.style.left = Math.min(r[0], r[2]) + 'px';
+        el.style.top = Math.min(r[1], r[3]) + 'px';
+        el.style.width = Math.abs(r[2] - r[0]) + 'px';
+        el.style.height = Math.abs(r[3] - r[1]) + 'px';
+        // 链接框（hyperref 的 linkbordercolor 红/绿/青）= **注释边框**，不在页面内容流里，
+        // canvas 画不出来，Edge 等阅读器是按 /Border + /C 现画的——我们也照画，否则看着不像链接。
+        const bs = a.borderStyle || {};
+        const bw = bs.width || 0;
+        if (bw > 0) {
+          const c = a.color;                                  // Uint8ClampedArray [r,g,b]
+          const rgb = c ? 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')' : 'rgb(17,17,17)';
+          const w = Math.max(1, Math.round(bw * s)) + 'px';
+          // PDF 边框样式：0/缺省=实线 1=虚线（hyperref 默认就是这个）2=凸 3=凹 4=下划线
+          const st = ({ 1: 'dashed', 2: 'solid', 3: 'solid', 4: 'solid' })[bs.style] || 'solid';
+          if (bs.style === 4) {                             // 下划线：只留下边
+            el.style.borderBottom = w + ' ' + st + ' ' + rgb;
+          } else {
+            el.style.border = w + ' ' + st + ' ' + rgb;
+          }
+        }
+        if (a.url) {                                          // 外部链接：新标签页打开
+          el.href = a.url; el.target = '_blank'; el.rel = 'noopener';
+        } else if (a.dest) {                                  // 内部链接：跳到目标页
+          el.href = '#';
+          el.addEventListener('click', ev => {
+            ev.preventDefault(); ev.stopPropagation();
+            destPage(a.dest).then(n => { if (n) PdfView.goTo(n); });
+          });
+        } else return;
+        layer.appendChild(el);
+      });
+      if (layer.children.length) { pg.el.appendChild(layer); pg.links = layer; }
+    }).catch(() => { /* 注释读取失败不该影响正文渲染 */ });
+  }
+
+  /* 命名目标 / 目标数组 → 页码（1 基）；解析不出来给 null（条目仍列出，只是不可点） */
+  function destPage(dest) {
+    if (!doc) return Promise.resolve(null);
+    return Promise.resolve()
+      .then(() => (typeof dest === 'string' ? doc.getDestination(dest) : dest))
+      .then(d => {
+        if (!d || !d.length) return null;
+        const ref = d[0];
+        if (typeof ref === 'number') return ref + 1;
+        return doc.getPageIndex(ref).then(i => i + 1);
+      })
+      .catch(() => null);
   }
 
   /* 在点中的位置画一个淡出的圈（跳转成功的视觉确认） */
@@ -343,6 +413,23 @@
     getZoom() { return myZoom(); },
 
     markAt,
+
+    /* PDF 自带书签（hyperref 生成的章节树）→ 归一成 {title, page, children[]}；
+       LaTeX 文档只要交了 hyperref 就有，没书签给空数组。解析不出的条目 page=null（仍列出，只是不可点）。 */
+    getOutline() {
+      if (!doc) return Promise.resolve([]);
+      const walk = it => destPage(it.dest).then(page => {
+        const kids = (it.items && it.items.length)
+          ? Promise.all(it.items.map(walk)) : Promise.resolve([]);
+        return kids.then(children => ({
+          title: String(it.title || '').replace(/\s+/g, ' ').trim() || '(无标题)',
+          page, children,
+        }));
+      });
+      return doc.getOutline()
+        .then(items => (items && items.length) ? Promise.all(items.map(walk)) : [])
+        .catch(() => []);
+    },
 
     goTo(n) {
       const pg = pages[n - 1];

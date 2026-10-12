@@ -4,38 +4,20 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Floria LaTeX</title>
-<link rel="stylesheet" href="css/app.css?v=0.2.0">
+<link rel="stylesheet" href="css/app.css?v=0.3.0">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23111111'/><text x='50' y='68' font-size='52' text-anchor='middle' font-family='Georgia' fill='white'>F</text></svg>">
 </head>
 <body>
 
-<!-- ============ 目录页 ============ -->
-<div id="view-catalog">
-  <header class="topbar">
-    <div class="tb-brand">
-      <div class="brand-mark">F</div>
-      <span class="tb-title">Pj18 · 论文项目</span>
-    </div>
-    <div class="tb-actions">
-      <button class="btn ghost slim" id="cat-refresh" title="重新扫描项目目录">刷新</button>
-      <button class="btn primary slim" id="cat-new">＋ 新建书稿</button>
-    </div>
-  </header>
-  <div class="cat-scroll">
-    <div class="cat">
-      <div class="cat-head">
-        <h2 class="cat-title">论文项目</h2>
-        <span class="cat-count" id="cat-count"></span>
-      </div>
-      <div class="cat-list" id="cat-list"></div>
-      <div class="cat-state hidden" id="cat-state"></div>
-    </div>
-  </div>
-</div>
-
-<!-- ============ 编辑页（纯 PDF） ============ -->
-<div id="view-viewer" class="hidden">
+<!-- ============ 唯一视图：纯 PDF（无目录页；打开哪篇由宿主广播 / 卡片命令驱动） ============ -->
+<div id="view-viewer">
   <div id="pdf-scroll"><div id="pdf-pages"></div></div>
+
+  <!-- 空态：还没有任何书稿被打开时铺在视图区（PDF 页一渲出来就被 #pdf-pages 盖住，无需显隐） -->
+  <div id="view-empty">
+    <div class="ve-title">还没有打开论文</div>
+    <div class="ve-hint" id="ve-hint">从左侧文件树点开任意一篇 .tex，这里就会显示它的 PDF。</div>
+  </div>
 
   <!-- 顶栏：**一条通栏白条**（照 Prism 的 PDF 预览列：白面 + 底边发丝线），只装三枚按钮 ——
        返回上级 / 编译 / 界面调整（用户 2026-10-07 定案：书稿名、编译态胶囊、工具入口、下载一律不要）。
@@ -43,7 +25,7 @@
   <div class="v-top">
     <div class="vt-group">
       <div class="vt-bar">
-        <button class="vt-btn" id="v-back" title="返回论文项目列表">← 目录</button>
+        <button class="vt-btn" id="v-back" title="返回文件树">← 目录</button>
         <button class="vt-btn primary" id="v-compile" title="本机重新编译这篇论文">编译</button>
         <div class="v-zoomwrap">
           <button class="vt-btn" id="pdf-zoom-toggle" title="界面大小调整"><span id="pdf-zoom-label">界面调整</span><span class="zcaret">▾</span></button>
@@ -80,6 +62,25 @@
   </div>
 
   <!-- 工具面板卡：卡头 = 工具 tab 条（注册表渲染）+ 收起；内容 = 各注册工具的 pane（全部常驻，按 applyToolTab 显隐） -->
+  <!-- 目录抽屉：读 PDF 自带书签（hyperref 的章节树），点条目跳页（Edge 那枚「目录」侧栏）。
+       入口 = PDF 左上角一枚浮按钮——顶栏锁死三枚按钮（用户 2026-10-07 定案），新按钮不进顶栏。 -->
+  <button id="toc-toggle" title="目录（PDF 书签）">
+    <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+      <path d="M6 4h7.5M6 8h7.5M6 12h7.5M2.5 4h.01M2.5 8h.01M2.5 12h.01"/>
+    </svg>
+  </button>
+  <aside id="toc-drawer" class="hidden">
+    <div class="toc-head">
+      <span class="toc-title">目录</span>
+      <button class="icon-btn" id="toc-close" title="收起">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+          <path d="M4.2 4.2 11.8 11.8M11.8 4.2 4.2 11.8"/>
+        </svg>
+      </button>
+    </div>
+    <div class="toc-body" id="toc-body"></div>
+  </aside>
+
   <aside id="side-card" class="hidden">
     <div class="sc-head">
       <div class="v-tooltabs in-card" id="tool-tabs"></div>
@@ -106,11 +107,11 @@
 <div id="toast" class="hidden"></div>
 
 <script src="lib/pdfjs/pdf.min.js"></script>
-<script src="js/pdfview.js?v=0.2.0"></script>
-<script src="js/util.js?v=0.2.0"></script>
-<script src="js/toolbar.js?v=0.2.0"></script>
-<script src="js/catalog.js?v=0.2.0"></script>
-<script src="js/viewer.js?v=0.2.0"></script>
-<script src="js/start.js?v=0.2.0"></script>
+<script src="js/pdfview.js?v=0.3.0"></script>
+<script src="js/util.js?v=0.3.0"></script>
+<script src="js/bridge.js?v=0.3.0"></script>
+<script src="js/toolbar.js?v=0.3.0"></script>
+<script src="js/viewer.js?v=0.3.0"></script>
+<script src="js/start.js?v=0.3.0"></script>
 </body>
 </html>

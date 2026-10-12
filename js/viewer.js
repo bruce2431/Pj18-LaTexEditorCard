@@ -109,6 +109,82 @@
     if (listEl() && listEl().dataset.mounted) renderLogPane();
   }
 
+  /* ---------------- 目录抽屉（PDF 自带书签 → 跳页） ----------------
+     书签树由 pdf.js 读（PdfView.getOutline），本文件只管画与跳。 */
+  const tocOpen_ = () => !$('toc-drawer').classList.contains('hidden');
+  function tocAct(on) {
+    $('toc-drawer').classList.toggle('hidden', !on);
+    $('toc-toggle').classList.toggle('hidden', on);   // 开着时藏起入口按钮
+    if (on) renderToc();
+  }
+  function renderToc() {
+    const body = $('toc-body');
+    if (!body) return;
+    const empty = (t, h) => '<div class="pane-empty"><p class="pe-title">' + esc(t) + '</p>' +
+      '<p class="pe-hint">' + esc(h) + '</p></div>';
+    if (!window.PdfView || !S.book) {
+      body.innerHTML = empty('还没有打开论文', '回目录页选一篇，再来这里按章节跳转。');
+      return;
+    }
+    body.innerHTML = '<div class="pane-empty"><p class="pe-hint">读取书签…</p></div>';
+    PdfView.getOutline().then(list => {
+      if (!tocOpen_()) return;                        // 期间被关掉就别再画
+      if (!list.length) {
+        body.innerHTML = empty('这篇 PDF 没有书签',
+          '编译时用了 \\usepackage{hyperref} 才有章节书签；也可以在 PDF 的目录页直接点链接跳转。');
+        return;
+      }
+      body.innerHTML = '';
+      const add = (items, depth) => items.forEach(it => {
+        const b = document.createElement('button');
+        b.className = 'toc-item lv' + Math.min(depth + 1, 4);
+        b.innerHTML = '<span class="toc-t">' + esc(it.title) + '</span>' +
+          (it.page ? '<span class="toc-pg">' + it.page + '</span>' : '');
+        if (it.page) b.dataset.page = it.page; else { b.disabled = true; b.classList.add('off'); }
+        body.appendChild(b);
+        if (it.children && it.children.length) add(it.children, depth + 1);
+      });
+      add(list, 0);
+      markToc();
+    }).catch(() => {
+      if (tocOpen_()) body.innerHTML = empty('书签读取失败', '可以直接在 PDF 的目录页点链接跳转。');
+    });
+  }
+  // 高亮「当前章节」= 起始页不超过当前页的最后一枚（滚动时跟着走）
+  function markToc() {
+    const rows = document.querySelectorAll('#toc-body .toc-item');
+    if (!rows.length) return;
+    const cur = parseInt(($('pdf-page-ind').textContent || '').split('/')[0], 10);
+    if (!Number.isFinite(cur)) return;
+    let best = null;
+    rows.forEach(r => {
+      r.classList.remove('on');
+      const p = +r.dataset.page;
+      if (p && p <= cur && (!best || p >= +best.dataset.page)) best = r;
+    });
+    if (best) best.classList.add('on');
+  }
+
+  /* ---------------- 空态（还没有任何书稿被打开时铺在视图区） ----------------
+     #view-empty 与 #pdf-pages 同层，DOM 在前 ⇒ PDF 页一渲出来就把它盖住，无需按态显隐。 */
+  function showEmpty(on) {
+    const el = $('view-empty');
+    if (el) el.classList.toggle('hidden', !on);
+  }
+  function setHint(t) { const h = $('ve-hint'); if (h && t) h.textContent = t; }
+
+  /* ---------------- 单开预载 ----------------
+     未桥接（file:// / 直起 server）时没有宿主来「打开某篇」，启动即挑第一篇**有 PDF 的**书稿顶上，
+     免得整块视图空着。桥接（iframe）时不抢跑，等宿主的 open 命令 / floria-pv-file-open 广播。 */
+  async function preload() {
+    if (F.bridge.embedded()) return;
+    try {
+      const books = await F.api('api/books');
+      const b = (books || []).find(x => x.pdf && x.pdf.exists) || (books || [])[0];
+      if (b && b.name) await open(b.name);
+    } catch (e) { /* 服务器不可达：保持空态（提示文案已说明） */ }
+  }
+
   /* ---------------- PDF 载入 / 编译 ---------------- */
   // soft=true：打开书稿时的「只读本地 PDF」路径——载不到不算编译失败，只回落成未编译态
   function loadPdf(soft) {
@@ -116,12 +192,15 @@
     const v = S.pdfMtime || Date.now();
     return PdfView.load('api/pdf?book=' + encodeURIComponent(S.book) + '&v=' + v, (cur, total) => {
       $('pdf-page-ind').textContent = cur + ' / ' + total;
+      markToc();                   // 目录抽屉开着时，高亮跟着翻页走
+      emitState();                 // 翻页 = 状态变化（emitState 自带去重）
     }, onPick).then(() => {
       setState('ok');
+      if (tocOpen_()) renderToc();  // 换书/重编后书签要重读
     }).catch(err => {
       if (soft) {
         setState('none');
-        F.toast('这篇还没有编译好的 PDF（.build/main.pdf）——点「编译」生成');
+        F.toast('这篇还没有编译好的 PDF（main.pdf）——点「编译」生成');
       } else {
         setState('err');
         pushLog({ ok: false, elapsed: '0.0', error: 'PDF 载入失败：' + (err && err.message || err), log: '' });
@@ -152,9 +231,91 @@
       applyToolTab('log', true);   // 编译失败 → 自动摊开日志卡（force：已在日志上也要保留）
       F.toast('编译失败：' + (r.error || '见日志'));
     }
+    emitState();
   }
 
-  /* ---------------- 点 PDF → 跳源码（无编辑器，只提示行号） ---------------- */
+  /* ---------------- 卡片 API（宿主桥，见 js/bridge.js） ----------------
+     本页没有编辑器，「跳转」只能出帧：查到源码位置后既弹卡内 toast，又发一条 src-open 请宿主的编辑卡
+     打开该文件并滚到该行（宿主侧 openWorkFile + 滚动到行）。 */
+  // 状态快照（唯一读处）：页码/页数读翻页指示器（它是页码的唯一读数，勿另算），编译态读 S.state，缩放读 PdfView。
+  function snapshot() {
+    const ind = ($('pdf-page-ind').textContent || '').split('/');
+    const page = parseInt(ind[0], 10), pages = parseInt(ind[1], 10);
+    return {
+      book: S.book || '',
+      page: Number.isFinite(page) ? page : 0,
+      pages: Number.isFinite(pages) ? pages : 0,
+      state: S.state,
+      busy: S.busy,
+      zoom: window.PdfView ? PdfView.getZoom() : null,
+    };
+  }
+  // 事件面去重（同 toolbar.js 的 lastPosted 教训）：翻页滚动会连着触发 onPage，不去重会把宿主刷屏。
+  let lastEmit = '';
+  function emitState() {
+    const s = JSON.stringify(snapshot());
+    if (s === lastEmit) return;
+    lastEmit = s;
+    F.bridge.emit('state', JSON.parse(s));
+  }
+
+  // 项目根相对 POSIX 路径 → 书稿名（= 目录，含多级，如 'PHYSIC/ch1'）。
+  // 口径与 server 一致：一目录 = 一篇，书稿名 = 该目录的根相对 POSIX 路径。
+  function bookFromPath(p) {
+    p = String(p || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    return p.indexOf('/') < 0 ? '' : p.slice(0, p.lastIndexOf('/'));
+  }
+  function openBook(name) {                       // 同步壳：立刻 ack，不等 PDF 载完
+    name = String(name || '');
+    if (!name) throw new Error('缺少书稿名');
+    open(name).then(emitState, () => {});
+    return name;
+  }
+
+  function bindBridge() {
+    const B = F.bridge;
+    B.onCmd('open', d => {                       // {book, page?} 打开书稿（可顺带跳到某页）
+      const name = String(d.book || '');
+      if (!name) throw new Error('open 缺少 book');
+      return open(name).then(() => {
+        const n = parseInt(d.page, 10);
+        if (Number.isFinite(n) && window.PdfView) PdfView.goTo(n);
+        emitState();
+        return name;
+      });
+    });
+    // 广播/通知面：宿主「用户打开了某文件」→ 本卡据此切换预览。
+    //   {type:'floria-pv-broadcast', ev:'file-open', path:'MATH/main.tex'}
+    //   path = 项目根相对 POSIX 路径；书稿名由目录段推出（与 /gateway/file 同口径）。
+    const onFileOpen = d => {
+      const book = bookFromPath(d && (d.path || d.book));
+      if (book) openBook(book);
+    };
+    B.onNote('floria-pv-broadcast', d => { if (d.ev === 'file-open') onFileOpen(d); });
+    B.onNote('floria-pv-event', d => { if (d.ev === 'file-open') onFileOpen(d); });
+    B.onCmd('page', d => {                       // {page} 在当前书稿内翻页（1 基）
+      const n = parseInt(d.page, 10);
+      if (!window.PdfView || !Number.isFinite(n)) throw new Error('page 参数非法');
+      PdfView.goTo(n);
+      return n;
+    });
+    B.onCmd('compile', () => compile());
+    B.onCmd('zoom', d => {                       // {mode: 'fit' | 'fitpage' | 数字倍率}
+      if (!window.PdfView) throw new Error('查看器未就绪');
+      const m = d.mode;
+      if (m === 'fit') PdfView.zoomFit();
+      else if (m === 'fitpage') PdfView.zoomFitPage();
+      else PdfView.zoomSet(m);
+      markZoom();
+      emitState();
+      return m;
+    });
+    B.onCmd('state', () => snapshot());          // 探活/取态：ack 里带 result，另发一条 state 事件
+    B.emit('ready', {});                         // 帧就绪：宿主据此下发命令（本页不缓存命令，重发由宿主负责）
+    emitState();
+  }
+
+  /* ---------------- 点 PDF → 跳源码（卡内提示 + 请宿主跳） ---------------- */
   async function onPick(page, x, y) {
     if (!S.book) return;
     try {
@@ -162,7 +323,11 @@
         '&page=' + page + '&x=' + x.toFixed(1) + '&y=' + y.toFixed(1));
       if (!d.ok) { F.toast(d.error || '没查到对应源码行'); return; }
       if (window.PdfView) PdfView.markAt(page, x, y);
-      F.toast('→ ' + (d.texName || 'main.tex') + ' 第 ' + d.line + ' 行');
+      const tex = d.texName || 'main.tex';
+      // path = 项目根相对 POSIX 路径（宿主 /gateway/file?label=&path= 同口径）：书稿名本身即根相对路径。
+      // 查不到源文件位置（d.ok=false）时上面已 return，故此处必有 line。
+      F.bridge.emit('src-open', { path: S.book + '/' + tex, line: d.line });
+      F.toast('→ ' + tex + ' 第 ' + d.line + ' 行');
     } catch (e) {
       F.toast('查询失败：' + (e.message || e));
     }
@@ -170,13 +335,16 @@
 
   /* ---------------- 打开 / 关闭书稿 ---------------- */
   async function open(name) {
-    if (S.book === name && !$('view-viewer').classList.contains('hidden')) return;
+    name = String(name || '');
+    if (!name) { close(); return; }                 // 空名 = 回到空态（无书稿打开）
+    if (S.book === name) return;                     // 已是当前篇：幂等（宿主重复广播不重载）
     S.book = name;
     S.pdfMtime = 0;
     setState('none');
     applyToolTab('');
     renderLogPane();
-    // 本页是「本地 PDF 显示器」：打开 = 直接读 .build/main.pdf，**从不自动编译**。
+    showEmpty(false);
+    // 本页是「本地 PDF 显示器」：打开 = 直接读书稿根的 main.pdf，**从不自动编译**。
     // 先问 /api/books 要该书的 pdf 状态：有才让 pdf.js 去取（**没 PDF 就不去取**——直接让 pdf.js
     // 撞 404 会在它内部留一个没人接的 promise 拒绝，控制台报 Uncaught）。
     let info = null;
@@ -189,7 +357,7 @@
       if (!info.fresh) setState('stale');   // 源码比 PDF 新 → 编译按钮改口「重新编译」
     } else {
       setState('none');
-      if (info) F.toast('这篇还没有编译好的 PDF（.build/main.pdf）——点「编译」生成');
+      if (info) F.toast('这篇还没有编译好的 PDF（main.pdf）——点「编译」生成');
     }
   }
 
@@ -200,6 +368,8 @@
     $('pdf-pages').innerHTML = '';
     $('pdf-page-ind').textContent = '– / –';
     applyToolTab('');
+    tocAct(false);
+    showEmpty(true);                 // 无书稿 = 空态
   }
 
   /* ---------------- 缩放 / 翻页 / 下载绑定 ---------------- */
@@ -213,6 +383,12 @@
   }
 
   function init() {
+    // 空态文案随场景变：桥接时指向宿主文件树，单开时指向本机 .tex
+    setHint(F.bridge.embedded()
+      ? '在左侧文件树里点开任意一篇 .tex，这里会显示它的 PDF。'
+      : '打开项目里的任意一篇 .tex（或直接起一篇已编译的书稿），这里会显示它的 PDF。');
+    showEmpty(true);
+
     /* 注册两枚工具（本页工具栏的**全部** tab 来源，顺序 = 注册顺序） */
     T.registerTool({ id: 'ver', title: '版本', pane: 'tool-ver' });
     T.registerTool({ id: 'log', title: '日志', pane: 'tool-log', mount: renderLogPane });
@@ -226,11 +402,29 @@
     window.addEventListener('floria:tool-select', e => applyToolTab((e.detail && e.detail.id) || ''));
     $('sc-close').addEventListener('click', () => applyToolTab(''));
     document.addEventListener('keydown', e => {
-      if (e.key === 'Escape' && !$('side-card').classList.contains('hidden')) applyToolTab('');
+      if (e.key !== 'Escape') return;
+      if (tocOpen_()) { tocAct(false); return; }        // 目录抽屉在最上层，先收它
+      if (!$('side-card').classList.contains('hidden')) applyToolTab('');
+    });
+
+    // 目录抽屉：入口浮按钮 + 卡头 ✕ + 点条目跳页
+    $('toc-toggle').addEventListener('click', () => tocAct(true));
+    $('toc-close').addEventListener('click', () => tocAct(false));
+    $('toc-body').addEventListener('click', e => {
+      const b = e.target.closest('.toc-item');
+      const n = b && +b.dataset.page;
+      if (!b || !n || !window.PdfView) return;
+      PdfView.goTo(n);
+      markToc();
     });
 
     $('v-compile').addEventListener('click', compile);
-    $('v-back').addEventListener('click', () => { location.hash = ''; });
+    // 「← 目录」：桥接时 = 请宿主亮出文件树（本页无目录页可回）；单开时 = 回到空态
+    $('v-back').addEventListener('click', () => {
+      if (F.bridge.embedded()) { F.bridge.emit('back', {}); F.toast('在左侧文件树里选择论文'); return; }
+      location.hash = '';
+      close();
+    });
 
     $('pdf-prev').addEventListener('click', () => { if (window.PdfView) PdfView.prev(); });
     $('pdf-next').addEventListener('click', () => { if (window.PdfView) PdfView.next(); });
@@ -262,7 +456,9 @@
     $('pdf-zoom-range').addEventListener('change', markZoom);
 
     // 工具面板卡里的滚动/点击不该被「点 PDF」拾取（picker 只挂 #pdf-pages，天然隔离）
+
+    bindBridge();   // 卡片 API：登记命令处理 + 向宿主报「就绪」
   }
 
-  F.viewer = { init, open, close, compile, applyToolTab, S };
+  F.viewer = { init, open, close, compile, preload, applyToolTab, S };
 })();
