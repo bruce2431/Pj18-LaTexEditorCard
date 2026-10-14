@@ -366,7 +366,10 @@
   const PdfView = {
     supported: !!pdfjsLib,
 
-    load(u, cb, pick) {
+    // keep=true：编译/轮询触发的重载——载完后回到重载前所在页（缩放本就走 localStorage，天然保留）。
+    // 页码须在 reset() 之前取（reset 会清空 pages），故这里先算 keepPg。
+    load(u, cb, pick, keep) {
+      const keepPg = keep ? currentPage() : 0;
       onPage = cb || onPage;
       onPick = pick || null;
       reset();
@@ -388,7 +391,10 @@
                : saved === 'fitpage' ? 'fitpage'
                : Math.min(MAXZ, Math.max(MINZ, parseFloat(saved) || null));
           applyZoom();
-          boxStart();
+          // 重载保持页码：回到重载前那一页页首（即时，不 smooth）。页码越界（重编后变少）则退回首页。
+          if (keepPg > 1 && pages[keepPg - 1]) pages[keepPg - 1].el.scrollIntoView({ block: 'start', inline: 'nearest' });
+          else boxStart();
+          updateIndicator();                 // 复位后立刻同步页码指示 + 目录高亮（不等滚动事件）
         });
       });
     },

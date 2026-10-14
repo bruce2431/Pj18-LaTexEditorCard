@@ -63,10 +63,18 @@ button { font-family: inherit; cursor: pointer; }
 #view-empty .ve-hint { font-size: 12.5px; color: var(--ink-faint); line-height: 1.7; max-width: 320px; }
 
 /* PDF 井从顶栏下沿开始（顶栏是通栏实体条，PDF 不从它底下穿过） */
+/* 注意：这里**不设** scroll-snap-type —— 见下方触屏媒体查询。
+   井里放 snap 时 Chrome 对鼠标滚轮是「先滚 delta、再单独跑一段 snap 动画」的两段式：
+   一格滚轮 = 滚到 +100 后被 snap 拉回，视觉上就是「滚一格滑两下」（实测 井宽700/页高933/视口852
+   → 净位移只有 81；井宽650/页高863 → 净位移 11；页高 < 视口时净位移 0 = 滚不动）。
+   井宽够大（页高 ≫ 视口）时 proximity 本就等于空转（净位移恒为 100，与关掉 snap 完全一致），
+   即桌面端 snap 只有「空转」和「打架」两种结果 → 鼠标/触控板一律不设，触屏才保留页首对齐。 */
 #pdf-scroll {
   position: absolute; top: 48px; left: 0; right: 0; bottom: 0; overflow: auto; background: var(--desk);
   -webkit-overflow-scrolling: touch; touch-action: pan-y pan-x;
-  scroll-snap-type: y proximity;     /* 垂直翻页：页首对齐 */
+}
+@media (hover: none) and (pointer: coarse) {
+  #pdf-scroll { scroll-snap-type: y proximity; }   /* 触屏：垂直翻页，页首对齐 */
 }
 #pdf-pages {
   display: flex; flex-direction: column; gap: 18px; padding: 20px;
@@ -89,23 +97,30 @@ button { font-family: inherit; cursor: pointer; }
 }
 
 /* 顶栏：**通栏白条**（照 Prism 的 PDF 预览列——白面 + 底边一条发丝线），不浮在 PDF 上。
-   条上只装三枚按钮：返回上级 / 编译 / 界面调整（用户 2026-10-07 定案）。 */
+   条上两处：左＝文章目录（图标），右＝编译 / 界面调整（用户 2026-10-12 定案；「← 目录」已删）。 */
 .v-top {
   position: absolute; top: 0; left: 0; right: 0; height: 48px; z-index: 12;
   display: flex; align-items: center; gap: 8px; padding: 0 12px;
   background: var(--panel); border-bottom: 1px solid var(--border);
 }
-.vt-group { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.vt-bar { display: flex; align-items: center; gap: 6px; min-width: 0; }
-/* 按钮 = Prism 顶栏那枚描边胶囊：白面 + 1px 描边 + 全圆角；「编译」是唯一吃墨的实心胶囊 */
+/* 右侧组（编译 / 界面调整）——margin-left:auto 把它推到条的最右 */
+.vt-right { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+/* 按钮：**隐藏式边界（幽灵）**——无描边无底色，hover 才浮出浅底；「编译」是唯一吃墨的实心胶囊 */
 .vt-btn {
-  display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--panel);
+  display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; background: transparent;
   color: var(--ink-soft); border-radius: 999px; padding: 5px 12px; font-size: 12.5px; white-space: nowrap;
 }
-.vt-btn:hover { border-color: var(--border-strong); background: var(--accent-soft); color: var(--ink); }
+.vt-btn:hover { border-color: transparent; background: var(--accent-soft); color: var(--ink); }
 .vt-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; padding: 5px 15px; }
 .vt-btn.primary:hover { background: var(--accent-deep); border-color: var(--accent-deep); color: var(--accent-fg); }
 #v-compile:disabled { opacity: .55; cursor: default; }
+/* 顶栏图标按钮（文章目录入口）：同为幽灵形态，方形浅底 */
+.vt-icon {
+  display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px;
+  border: 0; background: transparent; color: var(--ink-soft); border-radius: 8px;
+}
+.vt-icon:hover { background: var(--accent-soft); color: var(--ink); }
+.vt-icon.on { background: var(--accent-soft); color: var(--ink); }
 
 /* 工具 tab 条（内容由 js/toolbar.js 渲染；贴在工具卡卡头，观感照 Prism 的 工具面板 tab 条）
    —— 扁平文字 tab（不是浮条胶囊）：active = 文字加深 + 底部一条 1.5px 下划线 */
@@ -156,14 +171,8 @@ button { font-family: inherit; cursor: pointer; }
 #pdf-page-ind { font-size: 12px; min-width: 64px; text-align: center; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
 
 /* ---------- 目录抽屉（PDF 自带书签，Edge 式章节跳转） ---------- */
-/* 入口按钮浮在 PDF 左上角（不动顶栏那三枚按钮）；抽屉盖在 PDF 井上，井不重排（PDF 不因此重渲染） */
-#toc-toggle {
-  position: absolute; left: 10px; top: 58px; z-index: 13;
-  width: 30px; height: 30px; display: flex; align-items: center; justify-content: center;
-  background: var(--panel); border: 1px solid var(--border); border-radius: 9px;
-  color: var(--ink-soft); box-shadow: var(--shadow);
-}
-#toc-toggle:hover { color: var(--ink); border-color: var(--border-strong); background: var(--accent-soft); }
+/* 入口 = 顶栏左侧那枚 .vt-icon#toc-toggle（2026-10-12 从 PDF 左上角浮按钮挪进顶栏，改幽灵形态）；
+   抽屉盖在 PDF 井上，井不重排（PDF 不因此重渲染） */
 #toc-drawer {
   position: absolute; top: 48px; left: 0; bottom: 0; width: 264px; z-index: 13;
   display: flex; flex-direction: column; overflow: hidden;
@@ -240,6 +249,14 @@ button { font-family: inherit; cursor: pointer; }
   background: var(--bg-soft); border-radius: 8px;
   font-family: var(--mono); font-size: 11.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-all;
 }
+.log-by {
+  font-size: 10.5px; color: var(--ink-faint); border: 1px solid var(--border-soft);
+  border-radius: 4px; padding: 0 4px; flex: 0 0 auto; line-height: 1.6;
+}
+/* 版本行：摘要不展开原始 log（那归日志），页数/耗时缩进一行贴在成败下 */
+.ver-row { cursor: default; }
+.ver-meta { display: flex; gap: 14px; margin-top: 3px; padding-left: 20px;
+  font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
 
 /* ---------- toast ---------- */
 #toast {

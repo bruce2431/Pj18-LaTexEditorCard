@@ -1,7 +1,7 @@
 /* Floria LaTeX v2 — 编辑页：满屏 PDF（自绘查看器 = js/pdfview.js，原样复用）+ 编译 + 缩放 + 翻页
    + 工具面板。顶栏只有三枚按钮：返回上级 / 编译 / 界面调整（编译态不再单列胶囊，折在编译按钮的文案里）。
    工具 tab 不写死：本文件只往 js/toolbar.js 的注册表里登记两枚
-   （'ver' 版本 = 占位 / 'log' 日志 = 本次会话的编译记录），tab 条由注册表渲染。 */
+   （'ver' 版本快照 / 'log' 原始日志，共用同一份编译历史 = GET /api/history 的落盘账本），tab 条由注册表渲染。 */
 (function () {
   'use strict';
   const F = window.Floria;
@@ -12,7 +12,7 @@
     book: '',            // 当前书稿名（= /api/books 里的 name）
     pdfMtime: 0,
     busy: false,
-    logs: [],            // {ok, clock, elapsed, error, log}（内存，不落盘）
+    recs: [],            // 编译历史（日志/版本共用）：{ts, ok, elapsed, pages, by, error, log}，新→旧
     tool: '',            // 当前展开的工具 id
     state: 'none',       // 编译五态
   };
@@ -69,24 +69,55 @@
     if (t) t.classList.toggle('hidden', hasTabs);
   }
 
-  /* ---------------- 日志 pane ---------------- */
+  /* ---------------- 编译历史（日志 / 版本两枚工具的统一数据源） ----------------
+     服务端账本 = <书稿>/.build/compile-history.jsonl（GET /api/history），三个写入方同格式：
+     本页点「编译」(by=page)、AI 会话跑 compile_book.py (by=ai)、功能上线前的磁盘回溯 (by=disk)
+     ⇒ 天然合流、落盘可刷新。内存里另存的只有「PDF 载入失败」这类不成编译的本地提示。 */
+  function fmtClock(ts) {
+    const d = ts ? new Date(ts * 1000) : new Date();
+    const two = n => (n < 10 ? '0' : '') + n;
+    return two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
+  function fmtStamp(ts) {
+    const d = ts ? new Date(ts * 1000) : new Date();
+    const two = n => (n < 10 ? '0' : '') + n;
+    return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + fmtClock(ts);
+  }
+  const BY_TAG = { page: '页', ai: 'AI', disk: '盘' };
   function listEl() { return $('tool-log'); }
+  async function loadHistory() {
+    if (!S.book) { S.recs = []; renderPanes(); return; }
+    let records = null;
+    try {
+      const r = await F.api('api/history?book=' + encodeURIComponent(S.book));
+      records = (r && r.records) || [];
+    } catch (e) { return; }              // 服务器不可达：保留现有记录
+    S.recs = records.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));   // 新 → 旧
+    renderPanes();
+  }
+  function renderPanes() {
+    const l = listEl();
+    if (l && l.dataset.mounted) renderLogPane();
+    const v = $('tool-ver');
+    if (v && v.dataset.mounted) renderVerPane();
+  }
   function renderLogPane() {
     const el = listEl();
     if (!el) return;
     const sec = n => '<div class="pane-sec"><span class="pane-sec-title">原始日志</span>' +
       '<span class="pane-sec-note">' + n + '</span></div>';
-    if (!S.logs.length) {
+    if (!S.recs.length) {
       el.innerHTML = sec(0) + '<div class="pane-empty"><p class="pe-title">还没有编译记录</p>' +
         '<p class="pe-hint">点上方「编译」后，每次编译的结果与报错都会记在这里。</p></div>';
       return;
     }
-    el.innerHTML = sec(S.logs.length) + S.logs.map(e => `
+    el.innerHTML = sec(S.recs.length) + S.recs.map(e => `
       <div class="log-row${e.ok ? '' : ' bad'}">
         <div class="log-head">
           <span class="log-mark">${e.ok ? '✓' : '✕'}</span>
-          <span class="log-time">${esc(e.clock)}</span>
-          <span class="log-el">${e.elapsed}s</span>
+          <span class="log-time">${esc(fmtClock(e.ts))}</span>
+          <span class="log-el">${e.elapsed != null ? e.elapsed + 's' : '—'}</span>
+          ${BY_TAG[e.by] ? '<span class="log-by">' + BY_TAG[e.by] + '</span>' : ''}
           <span class="log-brief">${esc(e.error || '编译通过')}</span>
         </div>
         <pre class="log-body hidden">${esc(e.log || '(无输出)')}</pre>
@@ -96,17 +127,31 @@
       if (b) b.classList.toggle('hidden');
     }));
   }
-  function pushLog(e) {
-    const d = new Date();
-    const two = n => (n < 10 ? '0' : '') + n;
-    S.logs.unshift({
-      ok: !!e.ok,
-      clock: two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()),
-      elapsed: e.elapsed,
-      error: e.error || '',
-      log: e.log || '',
-    });
-    if (listEl() && listEl().dataset.mounted) renderLogPane();
+  function renderVerPane() {
+    const el = $('tool-ver');
+    if (!el) return;
+    const sec = n => '<div class="pane-sec"><span class="pane-sec-title">版本快照</span>' +
+      '<span class="pane-sec-note">' + n + '</span></div>';
+    if (!S.recs.length) {
+      el.innerHTML = sec(0) + '<div class="pane-empty"><p class="pe-title">还没有版本记录</p>' +
+        '<p class="pe-hint">每次编译（本页点「编译」或 AI 会话里编译）都会在这里留一条：时间 / 页数 / 耗时 / 成败。</p></div>';
+      return;
+    }
+    el.innerHTML = sec(S.recs.length) + S.recs.map(e => `
+      <div class="log-row ver-row${e.ok ? '' : ' bad'}">
+        <div class="log-head">
+          <span class="log-mark">${e.ok ? '✓' : '✕'}</span>
+          <span class="log-time">${esc(fmtStamp(e.ts))}</span>
+          ${BY_TAG[e.by] ? '<span class="log-by">' + BY_TAG[e.by] + '</span>' : ''}
+          <span class="log-brief">${esc(e.error || '编译通过')}</span>
+        </div>
+        <div class="ver-meta"><span>页数 ${e.pages != null ? e.pages : '—'}</span><span>耗时 ${e.elapsed != null ? e.elapsed + 's' : '—'}</span></div>
+      </div>`).join('');
+  }
+  function pushLocal(e) {              // 本地-only 记录（不成一次真编译，如 PDF 载入失败）
+    S.recs.unshift({ ts: Date.now() / 1000, ok: !!e.ok, elapsed: e.elapsed != null ? e.elapsed : null,
+      pages: null, by: 'page', error: e.error || '', log: e.log || '' });
+    renderPanes();
   }
 
   /* ---------------- 目录抽屉（PDF 自带书签 → 跳页） ----------------
@@ -114,7 +159,7 @@
   const tocOpen_ = () => !$('toc-drawer').classList.contains('hidden');
   function tocAct(on) {
     $('toc-drawer').classList.toggle('hidden', !on);
-    $('toc-toggle').classList.toggle('hidden', on);   // 开着时藏起入口按钮
+    $('toc-toggle').classList.toggle('on', on);   // 入口在顶栏，常驻；开着时只是变「按下」态
     if (on) renderToc();
   }
   function renderToc() {
@@ -187,14 +232,15 @@
 
   /* ---------------- PDF 载入 / 编译 ---------------- */
   // soft=true：打开书稿时的「只读本地 PDF」路径——载不到不算编译失败，只回落成未编译态
-  function loadPdf(soft) {
+  // keep=true：重载（编译后 / 外部编译轮询命中）——载完停在重载前那一页（见 pdfview.js load 的 keep）
+  function loadPdf(soft, keep) {
     if (!window.PdfView) return Promise.resolve();
     const v = S.pdfMtime || Date.now();
     return PdfView.load('api/pdf?book=' + encodeURIComponent(S.book) + '&v=' + v, (cur, total) => {
       $('pdf-page-ind').textContent = cur + ' / ' + total;
       markToc();                   // 目录抽屉开着时，高亮跟着翻页走
       emitState();                 // 翻页 = 状态变化（emitState 自带去重）
-    }, onPick).then(() => {
+    }, onPick, keep).then(() => {
       setState('ok');
       if (tocOpen_()) renderToc();  // 换书/重编后书签要重读
     }).catch(err => {
@@ -203,7 +249,7 @@
         F.toast('这篇还没有编译好的 PDF（main.pdf）——点「编译」生成');
       } else {
         setState('err');
-        pushLog({ ok: false, elapsed: '0.0', error: 'PDF 载入失败：' + (err && err.message || err), log: '' });
+        pushLocal({ ok: false, error: 'PDF 载入失败：' + (err && err.message || err), log: '' });
       }
     });
   }
@@ -220,12 +266,12 @@
     }
     S.busy = false;
     const elapsed = r.time != null ? r.time : 0;
-    pushLog({ ok: !!r.ok, elapsed, error: r.error || '', log: r.log || '' });
+    loadHistory();                        // 服务端 run_compile 已把这条追加进账本 → 拉回来即合流
     if (r.ok) {
       S.pdfMtime = r.mtime || Date.now();
       setState('ok');
       F.toast('编译完成（' + elapsed + 's）');
-      await loadPdf();
+      await loadPdf(false, true);            // 保持当前页码/缩放
     } else {
       setState('err');
       applyToolTab('log', true);   // 编译失败 → 自动摊开日志卡（force：已在日志上也要保留）
@@ -342,7 +388,8 @@
     S.pdfMtime = 0;
     setState('none');
     applyToolTab('');
-    renderLogPane();
+    S.recs = [];
+    loadHistory();                        // 拉这本书的编译账本（日志/版本两枚工具的数据源）
     showEmpty(false);
     // 本页是「本地 PDF 显示器」：打开 = 直接读书稿根的 main.pdf，**从不自动编译**。
     // 先问 /api/books 要该书的 pdf 状态：有才让 pdf.js 去取（**没 PDF 就不去取**——直接让 pdf.js
@@ -353,17 +400,51 @@
       info = (books.find(b => b.name === name) || {}).pdf || null;
     } catch (e) { /* 状态取不到：只当没 PDF，不弹提示（目录页已负责服务器不可达的文案） */ }
     if (info && info.exists) {
+      S.pdfMtime = info.mtime || 0;         // 记下当前 PDF mtime：轮询据此判「外部编译产出新 PDF」
       await loadPdf(true);
       if (!info.fresh) setState('stale');   // 源码比 PDF 新 → 编译按钮改口「重新编译」
     } else {
+      S.pdfMtime = 0;
       setState('none');
       if (info) F.toast('这篇还没有编译好的 PDF（main.pdf）——点「编译」生成');
     }
+    startWatch();                           // 书稿已打开 → 起轮询（A1：会话里 AI 编译也能自动换新）
   }
 
+  /* ---------------- 外部编译感知（A1） ----------------
+     用户在会话里让 AI 跑 compile_book.py（不经前端），卡片无感知、PDF 停旧版。
+     轻量轮询 /api/books 比对本书 pdf.mtime：变了就重载（保持页码/缩放），不引入长连接。
+     仅在已打开书稿时轮询；本页自己编译时 S.busy=true，跳过（其 mtime 由 compile 自己回填）。 */
+  const POLL_MS = 4000;
+  let watcher = null;
+  async function pollOnce() {
+    if (!S.book || S.busy) return;
+    let info = null;
+    try {
+      const books = await F.api('api/books');
+      info = (books.find(b => b.name === S.book) || {}).pdf || null;
+    } catch (e) { return; }                 // 服务器不可达：本轮跳过，下轮再试
+    if (!info || !info.exists) return;
+    if (info.mtime && info.mtime !== S.pdfMtime) {
+      S.pdfMtime = info.mtime;
+      await loadPdf(false, true);           // 外部编译产出新 PDF → 换新，停在当前页
+      loadHistory();                        // 外部编译（AI 会话/手工）的记录也同步进日志/版本
+      F.toast('检测到新编译的 PDF，已刷新');
+      emitState();
+    }
+  }
+  function startWatch() {
+    stopWatch();
+    if (!S.book) return;
+    watcher = setInterval(pollOnce, POLL_MS);
+  }
+  function stopWatch() { if (watcher) { clearInterval(watcher); watcher = null; } }
+
   function close() {
+    stopWatch();
     S.book = '';
     S.busy = false;
+    S.recs = [];
     if (window.PdfView) PdfView.destroy();
     $('pdf-pages').innerHTML = '';
     $('pdf-page-ind').textContent = '– / –';
@@ -390,7 +471,7 @@
     showEmpty(true);
 
     /* 注册两枚工具（本页工具栏的**全部** tab 来源，顺序 = 注册顺序） */
-    T.registerTool({ id: 'ver', title: '版本', pane: 'tool-ver' });
+    T.registerTool({ id: 'ver', title: '版本', pane: 'tool-ver', mount: renderVerPane });
     T.registerTool({ id: 'log', title: '日志', pane: 'tool-log', mount: renderLogPane });
 
     $('tool-tabs').addEventListener('click', e => {
@@ -407,8 +488,8 @@
       if (!$('side-card').classList.contains('hidden')) applyToolTab('');
     });
 
-    // 目录抽屉：入口浮按钮 + 卡头 ✕ + 点条目跳页
-    $('toc-toggle').addEventListener('click', () => tocAct(true));
+    // 目录抽屉：入口（顶栏图标）+ 卡头 ✕ + 点条目跳页（入口再点一次收起）
+    $('toc-toggle').addEventListener('click', () => tocAct(!tocOpen_()));
     $('toc-close').addEventListener('click', () => tocAct(false));
     $('toc-body').addEventListener('click', e => {
       const b = e.target.closest('.toc-item');
@@ -419,12 +500,6 @@
     });
 
     $('v-compile').addEventListener('click', compile);
-    // 「← 目录」：桥接时 = 请宿主亮出文件树（本页无目录页可回）；单开时 = 回到空态
-    $('v-back').addEventListener('click', () => {
-      if (F.bridge.embedded()) { F.bridge.emit('back', {}); F.toast('在左侧文件树里选择论文'); return; }
-      location.hash = '';
-      close();
-    });
 
     $('pdf-prev').addEventListener('click', () => { if (window.PdfView) PdfView.prev(); });
     $('pdf-next').addEventListener('click', () => { if (window.PdfView) PdfView.next(); });
@@ -460,5 +535,5 @@
     bindBridge();   // 卡片 API：登记命令处理 + 向宿主报「就绪」
   }
 
-  F.viewer = { init, open, close, compile, preload, applyToolTab, S };
+  F.viewer = { init, open, close, compile, preload, applyToolTab, loadHistory, S };
 })();

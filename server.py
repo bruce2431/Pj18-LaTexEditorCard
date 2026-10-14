@@ -122,6 +122,112 @@ def book_pdf_info(b):
     return {'exists': True, 'fresh': fresh, 'mtime': int(os.path.getmtime(pdf_p) * 1000)}
 
 
+# ---------- 编译历史（「日志」「版本」两枚工具的统一数据源） ----------
+# 落盘 = <书稿>/.build/compile-history.jsonl，一行一条 JSON：
+#   {ts, ok, elapsed, pages, by, error, log}
+#     ts      = 编译完成时刻（epoch 秒，float）
+#     ok      = 是否成功
+#     elapsed = 耗时（秒，float）；回溯补的记录拿不到给 null
+#     pages   = 成品页数（抓 "Output written on … (N pages)"）；抓不到给 null
+#     by      = 来源：'page'（本页点「编译」）/ 'ai'（会话里跑 compile_book.py）
+#               / 'disk'（本功能上线前编的，由磁盘产物回溯）
+#     error   = 失败首行；log = 原始日志（截断）
+# 两个写入方写同一格式 ⇒ 前端「日志」「版本」读 GET /api/history 即可，天然合流、按时间排序。
+LEDGER_NAME = 'compile-history.jsonl'
+LEDGER_MAX = 200            # 只回最近 N 条；文件本身只追加不裁剪（避免并发读改写）
+
+
+def ledger_path(name):
+    return os.path.join(BOOKS_ROOT, name, '.build', LEDGER_NAME)
+
+
+def ledger_append(name, rec):
+    """追加一条编译记录（只追加，短行写靠 'a' 的原子性，无需锁）。"""
+    p = ledger_path(name)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    except OSError:
+        pass
+
+
+def pages_in(text):
+    """从编译输出里抓成品页数：优先 'Output written on …pdf (N pages)'，退其次任意一条。"""
+    if not text:
+        return None
+    best = None
+    for m in re.finditer(r'Output written on ([^\n(]*?)\((\d+)\s+pages?', text):
+        if m.group(1).lower().endswith('.pdf'):
+            return int(m.group(2))
+        best = int(m.group(2))
+    return best
+
+
+def _scrape_log(logpath):
+    """从 .build/main.log 抓「上次编译」的成败与页数（供账本为空时回溯补一条）。"""
+    try:
+        with open(logpath, 'r', encoding='utf-8', errors='replace') as f:
+            txt = f.read()
+    except OSError:
+        return (None, None)
+    ok = ('Output written on' in txt and 'Fatal error occurred' not in txt
+          and 'Emergency stop' not in txt)
+    return (ok, pages_in(txt))
+
+
+def _backfill(name, recs):
+    """账本比磁盘编译痕迹旧 ⇒ 有绕过账本的编译（手工 latexmk / 其他脚本 / 失败编译）→ 补一条回溯。
+
+    权威兜底（2026-10-14 用户拍板：版本/日志链路必须全自动，不依赖谁记得写账）：
+    痕迹 mtime = max(main.pdf, .build/main.log, .build/main.fdb_latexmk)——失败的编译没有新 PDF，
+    但 main.log/.fdb 会更新。痕迹比账本最新 ts 新 1s 以上就补一条（补完账本里已有同 ts 记录，
+    下次读不再触发，自愈）。耗时无法回溯（null）；成败/页数从 .build/main.log 抓，抓不到给 null。
+    一次只补最新一条（连续多次绕账编译只留最近一次的痕，可接受）。
+    """
+    traces = [book_pdf_path(name),
+              os.path.join(BOOKS_ROOT, name, '.build', 'main.log'),
+              os.path.join(BOOKS_ROOT, name, '.build', 'main.fdb_latexmk')]
+    mt = 0.0
+    for p in traces:
+        try:
+            mt = max(mt, os.path.getmtime(p))
+        except OSError:
+            pass
+    if mt <= 0:
+        return recs
+    newest = max((r.get('ts') or 0) for r in recs) if recs else 0
+    if mt <= newest + 1:
+        return recs
+    ok, pages = _scrape_log(os.path.join(BOOKS_ROOT, name, '.build', 'main.log'))
+    rec = {'ts': round(mt, 3), 'ok': (ok if ok is not None else True), 'elapsed': None,
+           'pages': pages, 'by': 'disk', 'error': '', 'log': '（由磁盘产物回溯的编译记录）'}
+    ledger_append(name, rec)
+    recs.append(rec)
+    return recs
+
+
+def ledger_read(name):
+    """读账本（最近 LEDGER_MAX 条，**按时间倒序**：下标 0 = 最新）。坏行/空行跳过。"""
+    recs = []
+    try:
+        with open(ledger_path(name), 'r', encoding='utf-8', errors='replace') as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    recs.append(json.loads(ln))
+                except ValueError:
+                    continue
+    except OSError:
+        recs = []
+    recs = _backfill(name, recs)      # 兜底也覆盖「账本为空但磁盘有痕」：newest=0 必触发回溯
+    recs = recs[-LEDGER_MAX:]
+    recs.reverse()
+    return {'ok': True, 'records': recs}
+
+
 # ---------- 内置编译链定位（MiKTeX Portable 随 preview/tex/ 携带） ----------
 # 编译工具优先用**项目自带**的（APP_DIR/tex/ 下任意深度的同名可执行文件），
 # 找不到才回落系统 PATH —— 使本应用自包含：整体拷到别的机器无需另装 TeX。
@@ -202,6 +308,23 @@ def _hoist_outputs(book_dir):
                 pass
 
 
+def _pdf_pages(pdf_p):
+    """pdfinfo 数成品页数（便携链自带）；拿不到给 None（前端显示「—」）。"""
+    exe = find_tex_tool('pdfinfo')
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, pdf_p], capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=60,
+                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        for ln in p.stdout.splitlines():
+            if ln.lower().startswith('pages:'):
+                return int(ln.split(':', 1)[1].strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 def run_compile(b):
     """latexmk -xelatex 编译书稿 → **书稿根的 main.pdf**（引擎优先用项目自带的 MiKTeX）。
 
@@ -226,6 +349,11 @@ def run_compile(b):
     if not use_mk and not tex:
         return {'ok': False, 'error': '未找到可用的 TeX 引擎（项目自带 tex/ 与系统 PATH 均无 xelatex）', 'log': '', 'time': 0}
     env = os.environ.copy()
+    # git-bash 会导出 LANG=zh_CN.UTF-8 —— MiKTeX 自带 perl 在该 locale 下把带中文的脚本路径
+    # 转码失败（"Can't open perl script"，0.7s 即退，退出码 4294967295；2026-10-14 实测踩过）。
+    # 从 bash 起的临时实例/网关都会把 locale 传进来，编译子进程一律剥掉。
+    for k in ('LANG', 'LC_ALL', 'LC_CTYPE'):
+        env.pop(k, None)
     if use_mk:
         # 老书稿（改前编译的）没有 synctex，而 latexmk 会认为 PDF 是最新的直接跳过
         # → 首次补一把 -g 强制全量，之后 synctex 已在，恢复增量（秒级）
@@ -254,6 +382,13 @@ def run_compile(b):
         pdf_p = book_pdf_path(b['name'])
         if (second.returncode if second else p.returncode) == 0 and os.path.isfile(pdf_p):
             log = ((second.stdout if second else p.stdout) or '') + '\n' + chain
+            pages = pages_in(log)
+            if pages is None:      # xelatex 的「Output written on …xdv」不进 latexmk stdout → 回退解析
+                _ok2, pages = _scrape_log(os.path.join(build_dir, 'main.log'))
+            if pages is None:
+                pages = _pdf_pages(pdf_p)
+            ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': True, 'elapsed': elapsed,
+                                      'pages': pages, 'by': 'page', 'error': '', 'log': log[-1200:]})
             return {'ok': True, 'time': elapsed, 'mtime': int(os.path.getmtime(pdf_p) * 1000),
                     'log': log[-1200:]}
         log = ((second or p).stdout or '') + '\n' + ((second or p).stderr or '')
@@ -262,10 +397,16 @@ def run_compile(b):
                 if ln.startswith('!') or ':error:' in ln or 'Emergency stop' in ln
                 or 'did not succeed' in ln or 'could not find' in ln]
         tail = ('\n'.join(errs[-12:]) or log[-1500:]) + '\n' + chain
-        return {'ok': False, 'time': elapsed, 'log': tail, 'error': '编译失败（返回码 %d）' % (second or p).returncode}
+        err = '编译失败（返回码 %d）' % (second or p).returncode
+        ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': False, 'elapsed': elapsed,
+                                  'pages': None, 'by': 'page', 'error': err, 'log': tail})
+        return {'ok': False, 'time': elapsed, 'log': tail, 'error': err}
     except subprocess.TimeoutExpired:
-        return {'ok': False, 'time': round(time.time() - t0, 1),
-                'error': '编译超时（420s）——首次编译装包或图形宏包可能太慢，可先在 VSCode 里编译一次', 'log': ''}
+        elapsed = round(time.time() - t0, 1)
+        msg = '编译超时（420s）——首次编译装包或图形宏包可能太慢，可先在 VSCode 里编译一次'
+        ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': False, 'elapsed': elapsed,
+                                  'pages': None, 'by': 'page', 'error': msg, 'log': ''})
+        return {'ok': False, 'time': elapsed, 'error': msg, 'log': ''}
 
 
 # ---------- SyncTeX：PDF 坐标 → 源码行（点击 PDF 跳回源码） ----------
@@ -467,7 +608,7 @@ def create_book(name):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'FloriaLaTeX/0.3.0'
+    server_version = 'FloriaLaTeX/0.4.0'
 
     def log_message(self, fmt, *args):
         if self.path.startswith('/api') or self.path.startswith('/img'):
@@ -512,6 +653,11 @@ class Handler(BaseHTTPRequestHandler):
             for b in books:          # 目录页要显示「已编译 / 未编译」，随列表一次带回，省得逐本再请求
                 b['pdf'] = book_pdf_info(b)
             return self.send_json(books)
+        if path.startswith('/api/history'):
+            b = find_book(self.query().get('book', ''))
+            if not b:
+                return self.send_json({'ok': False, 'error': 'book not found'}, 404)
+            return self.send_json(ledger_read(b['name']))
         if path.startswith('/api/read'):
             qs = {}
             if '?' in self.path:
