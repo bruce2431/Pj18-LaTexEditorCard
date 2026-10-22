@@ -112,13 +112,33 @@ def book_synctex_path(name):
     return os.path.join(BOOKS_ROOT, name, 'main.synctex.gz')
 
 
+def newest_tex_mtime(book_name):
+    """书稿目录下所有 .tex 的最新 mtime（含分章子目录，跳过 .build/隐藏目录）。
+
+    拆分后正文在 sectionN/content.tex，只改章节文件不会碰主 .tex；只看 main.tex 会把
+    已过期的 PDF 误判成 fresh（2026-10-21）。
+    """
+    base = os.path.join(BOOKS_ROOT, book_name)
+    newest = 0.0
+    for cur, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__')]
+        for f in files:
+            if f.lower().endswith('.tex') and not f.startswith('.'):
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(cur, f)))
+                except OSError:
+                    pass
+    return newest
+
+
 def book_pdf_info(b):
-    """书稿的 PDF 编译产物状态：exists=有 main.pdf；fresh=pdf 比 .tex 新（无需重编）。"""
-    tex_p = os.path.join(BOOKS_ROOT, b['name'], b['texName'])
+    """书稿的 PDF 编译产物状态：exists=有 main.pdf；fresh=pdf 比任何 .tex 新（无需重编）。"""
     pdf_p = book_pdf_path(b['name'])
     if not os.path.isfile(pdf_p):
         return {'exists': False, 'fresh': False, 'mtime': 0}
-    fresh = os.path.getmtime(pdf_p) >= os.path.getmtime(tex_p) - 1
+    tex_mtime = newest_tex_mtime(b['name']) or os.path.getmtime(
+        os.path.join(BOOKS_ROOT, b['name'], b['texName']))
+    fresh = os.path.getmtime(pdf_p) >= tex_mtime - 1
     return {'exists': True, 'fresh': fresh, 'mtime': int(os.path.getmtime(pdf_p) * 1000)}
 
 
@@ -368,6 +388,24 @@ def run_compile(b):
                '-output-directory=.build', b['texName']]
     chain = ('[编译链] latexmk -xelatex 增量（perl: %s）' % perl) if use_mk else \
             '[编译链] xelatex 直驱两遍（未找到 perl，已跳过 latexmk；较慢）'
+    # 快速路径（2026-10-22）：拆分书稿 → 只编改动的章（并行）+ pypdf 拼接 + synctex 合并。
+    # 前提不满足或任何一步失败 → 返回 None，回落到下面的整本 latexmk（行为与旧版一致）。
+    skip = ''
+    try:
+        import fastbuild
+        fr = fastbuild.try_compile(book_dir, b['name'], mk, perl, env)
+        if not fr:
+            skip = getattr(fastbuild, 'LAST_SKIP', '') or ''
+    except Exception as ex:                 # noqa: BLE001
+        fr = None
+        skip = '快速路径异常：%s' % ex
+    if fr:
+        ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': True, 'elapsed': fr['time'],
+                                  'pages': fr.get('pages'), 'by': 'chapter', 'error': '',
+                                  'log': fr['log']})
+        return fr
+    if skip:
+        chain += '\n[编译链] 未走快速路径：' + skip
     t0 = time.time()
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     try:
@@ -389,6 +427,11 @@ def run_compile(b):
                 pages = _pdf_pages(pdf_p)
             ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': True, 'elapsed': elapsed,
                                       'pages': pages, 'by': 'page', 'error': '', 'log': log[-1200:]})
+            try:      # 整本编译成功后刷新按章缓存（前置页页数 + 各章 hash/页数）
+                import fastbuild
+                fastbuild.refresh_cache(book_dir)
+            except Exception:
+                pass
             return {'ok': True, 'time': elapsed, 'mtime': int(os.path.getmtime(pdf_p) * 1000),
                     'log': log[-1200:]}
         log = ((second or p).stdout or '') + '\n' + ((second or p).stderr or '')
@@ -434,18 +477,39 @@ def sync_k(data):
     return data['unit'] / 65536.0 * (1000.0 / data['mag']) * SYNC_PT
 
 
-def _parse_synctex(path, tex_name):
-    """解析 .synctex.gz，只留根文件（书稿 main.tex）的记录，按页分组。"""
+def _parse_synctex(path, tex_name, book_dir):
+    """解析 .synctex.gz，按页分组。
+
+    2026-10-22 起快速编译的 synctex 已把自动分章的块记录合并并改写成 main.tex，正常情况下
+    只会命中 main.tex。这里仍按多文件解析：SyncTeX 1.5 会把 Input 懒写在正文里，且块编译产物
+    藏在 .build/（路径含 . 开头段落 → 被过滤），留一套通用映射以备将来真有多文件书稿。
+    """
     mag, unit, ox, oy = 1000.0, 1.0, 0.0, 0.0
-    root, pages, page = 1, {}, 0     # SyncTeX 约定 Input 1 = 根文档
+    inputs, pages, page = {}, {}, 0
+    root = 1
+
+    def add_input(raw):
+        nonlocal root
+        parts = raw.rstrip('\n').split(':', 2)
+        if len(parts) != 3:
+            return
+        try:
+            tag = int(parts[1])
+        except ValueError:
+            return
+        p = parts[2].strip()
+        if not os.path.isabs(p):
+            p = os.path.join(book_dir, p)
+        inputs[tag] = os.path.normpath(p)
+        if tex_name and os.path.basename(p).lower() == tex_name.lower():
+            root = tag
+
     with gzip.open(path, 'rt', encoding='utf-8', errors='replace') as f:
         for raw in f:                # 头部：Input / Magnification / Unit / Offset，直到 Content:
             if raw.startswith('Content:'):
                 break
             if raw.startswith('Input:'):
-                parts = raw.rstrip('\n').split(':', 2)
-                if len(parts) == 3 and tex_name and os.path.basename(parts[2]).lower() == tex_name.lower():
-                    root = int(parts[1])
+                add_input(raw)
             elif raw.startswith('Magnification:'):
                 mag = float(raw.split(':', 1)[1] or 1000) or 1000.0
             elif raw.startswith('Unit:'):
@@ -465,23 +529,46 @@ def _parse_synctex(path, tex_name):
             if c == '}':
                 page = 0
                 continue
+            # ★ `\include` 的章节文件不在头部登记：SyncTeX 1.5 会把 `Input:<tag>:<path>`
+            #   懒写在正文里（且可能**排在它的记录之后**）⇒ 先收记录，末尾再按 tag 过滤。
+            if raw.startswith('Input:'):
+                add_input(raw)
+                continue
             if page == 0:
                 continue
             m = SYNC_REC.match(raw)
             if not m:
                 continue
             g = m.groupdict()
-            if g['tag'] is None or int(g['tag']) != root or g['x'] is None:
+            if g['tag'] is None or g['x'] is None:
                 continue
             pages[page].append((int(g['line']), int(g['x']), int(g['y']),
-                                int(g['w'] or 0), int(g['h'] or 0), int(g['d'] or 0)))
-    return {'pages': pages, 'mag': mag, 'unit': unit, 'ox': ox, 'oy': oy, 'root': root}
+                                int(g['w'] or 0), int(g['h'] or 0), int(g['d'] or 0),
+                                int(g['tag'])))
+    base = os.path.abspath(book_dir)
+    files = {}
+    for tag, p in inputs.items():
+        ap = os.path.abspath(p)
+        try:
+            rel = os.path.relpath(ap, base)
+        except ValueError:           # 跨盘符
+            continue
+        segs = rel.replace(os.sep, '/').split('/')
+        if rel.startswith('..') or any(s.startswith('.') for s in segs):
+            continue
+        if not ap.lower().endswith('.tex'):
+            continue
+        files[tag] = '/'.join(segs)
+    for pg, recs in pages.items():
+        pages[pg] = [r for r in recs if r[6] in files]
+    return {'pages': pages, 'files': files, 'mag': mag, 'unit': unit,
+            'ox': ox, 'oy': oy, 'root': root}
 
 
-def load_synctex(path, tex_name):
+def load_synctex(path, tex_name, book_dir):
     key = (path, os.path.getmtime(path), os.path.getsize(path))
     if SYNC_CACHE['key'] != key:
-        SYNC_CACHE['key'], SYNC_CACHE['data'] = key, _parse_synctex(path, tex_name)
+        SYNC_CACHE['key'], SYNC_CACHE['data'] = key, _parse_synctex(path, tex_name, book_dir)
     return SYNC_CACHE['data']
 
 
@@ -520,12 +607,16 @@ def _page_lines(data, page):
 
 
 def synctex_lookup(b, page, xpt, ypt):
-    """(书稿, 页号, PDF 坐标 pt·原点页面左上) → {'line': 行号} 或 {'error': …}。"""
+    """(书稿, 页号, PDF 坐标 pt·原点页面左上) → {'line', 'page', 'file'} 或 {'error': …}。
+
+    file = 命中行所属源文件（书稿相对 POSIX 路径，如 `section3/content.tex`）。
+    """
     path = book_synctex_path(b['name'])
     if not os.path.isfile(path):
         return {'error': '还没有 synctex 数据——请点状态胶囊重新编译一次（编译已带 -synctex=1）'}
     try:
-        data = load_synctex(path, os.path.basename(b['texName']))
+        data = load_synctex(path, os.path.basename(b['texName']),
+                            os.path.join(BOOKS_ROOT, b['name']))
     except (OSError, EOFError, gzip.BadGzipFile) as e:
         return {'error': 'synctex 解析失败：%s' % e}
     page = int(page)
@@ -540,27 +631,34 @@ def synctex_lookup(b, page, xpt, ypt):
     # 该 y 处的「应有行号」：单调基准里离得最近的一条
     ys = [r[2] for r in mono]
     i = bisect.bisect_left(ys, vy)
-    ref = min(mono[max(0, i - 1):i + 1] or mono, key=lambda r: abs(r[2] - vy))[0]
+    ref = min(mono[max(0, i - 1):i + 1] or mono, key=lambda r: abs(r[2] - vy))
+    files = data.get('files') or {}
+
+    def out(line, tag):
+        return {'line': line, 'page': page,
+                'file': files.get(tag) or b['texName']}
+
     best = None
-    for (line, x, y, w, h, d) in cands:
+    for (line, x, y, w, h, d, tag) in cands:
         # 盒内判定：x 向右、y 向下（高度在基线上方、depth 在下方）；最小盒 = 最内层，最精确
         if w > 0 and (x - tol) <= vx <= (x + w + tol) and (y - h - tol) <= vy <= (y + d + tol):
             area = w * max(h + d, 1)
             if best is None or area <= best[0]:
-                best = (area, line, x, y)              # 连 (x,y) 一起记，供下面同原点取最小行
+                best = (area, line, x, y, tag)             # 连 (x,y) 一起记，供下面同原点取最小行
     if best is None:
-        return {'line': ref, 'page': page}             # 无盒命中（页边/纯图页）→ 正文最近行
+        return out(ref[0], ref[6])                         # 无盒命中（页边/纯图页）→ 正文最近行
     # ★ 同一 (x,y) 原点的记录里取最小行号（2026-10-12）：外层行盒的行号是 \par 收尾时的
     #   「当前行」，而它的内容记录（hbox/kern/glue）才带真正所在行 —— 外层行盒与首内容常共享
     #   同一原点，取最小即回到真值行（残差 +1 的主因）。实测以 synctex.exe 为参照
     #   （全本 MATH 每页抽 3 词，n=206）：完全一致 33%→39%、中位仍 +1、|Δ|≤2 98%。
-    same = [r[0] for r in (data['pages'].get(page) or []) if r[1] == best[2] and r[2] == best[3]]
+    same = [r[0] for r in (data['pages'].get(page) or [])
+            if r[1] == best[2] and r[2] == best[3] and r[6] == best[4]]
     cand = min(same) if same else best[1]
     # 页眉/页脚/大图上的 shipout 伪记录，其行号（= 本页末尾行）远离单调基准 → 被这条挡下，
     # 回落「该 y 处的正文最近行」。故 margin_band 那条独立判据已被本判据覆盖，删去。
-    if abs(cand - ref) <= SYNC_TRUST:
-        return {'line': cand, 'page': page}
-    return {'line': ref, 'page': page}                 # 否则用最近的正文行（页边/大图/伪记录）
+    if abs(cand - ref[0]) <= SYNC_TRUST:
+        return out(cand, best[4])
+    return out(ref[0], ref[6])                             # 否则用最近的正文行（页边/大图/伪记录）
 
 
 NEW_BOOK_TEX = r"""\documentclass[UTF8]{ctexart}
@@ -608,7 +706,7 @@ def create_book(name):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'FloriaLaTeX/0.4.0'
+    server_version = 'FloriaLaTeX/0.5.0'
 
     def log_message(self, fmt, *args):
         if self.path.startswith('/api') or self.path.startswith('/img'):
@@ -704,7 +802,8 @@ class Handler(BaseHTTPRequestHandler):
             r = synctex_lookup(b, page, x, y)
             if 'error' in r:
                 return self.send_json({'ok': False, 'error': r['error']})
-            return self.send_json({'ok': True, 'line': r['line'], 'page': r['page'], 'texName': b['texName']})
+            return self.send_json({'ok': True, 'line': r['line'], 'page': r['page'],
+                                   'texName': r.get('file') or b['texName']})
         if path.startswith('/api/pdf'):
             qs = {}
             if '?' in self.path:
@@ -720,7 +819,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({'error': '尚未编译'}, 404)
             return self.send_file(pdf_p)
         if path in ('/', '/index.html'):
-            return self.send_file(os.path.join(APP_DIR, 'index.html'))
+            # 多卡片架构（2026-10-18）：PDF 卡迁进 pdf/。根地址 302 过去——**必须相对跳转**，
+            # 反代下浏览器在 /backend/<label>/，相对 Location 才能落到 /backend/<label>/pdf/index.html。
+            return self.send_redirect('pdf/index.html')
         # 静态资源：仅 app/ 目录内部（normpath 已折叠 ../..，前缀必须含分隔符防兄弟目录）
         rel = path.lstrip('/')
         if rel == 'tex' or rel.startswith('tex/'):

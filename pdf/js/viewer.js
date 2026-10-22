@@ -1,7 +1,7 @@
-/* Floria LaTeX v2 — 编辑页：满屏 PDF（自绘查看器 = js/pdfview.js，原样复用）+ 编译 + 缩放 + 翻页
-   + 工具面板。顶栏只有三枚按钮：返回上级 / 编译 / 界面调整（编译态不再单列胶囊，折在编译按钮的文案里）。
-   工具 tab 不写死：本文件只往 js/toolbar.js 的注册表里登记两枚
-   （'ver' 版本快照 / 'log' 原始日志，共用同一份编译历史 = GET /api/history 的落盘账本），tab 条由注册表渲染。 */
+/* Floria LaTeX v2 — PDF 卡：满屏 PDF（自绘查看器 = js/pdfview.js，原样复用）+ 编译 + 缩放 + 翻页
+   + 工具面板。顶栏只有「文章目录 / 编译 / 界面调整」（编译态折在编译按钮的文案里）。
+   多卡片架构（2026-10-18）：编译失败时向宿主发 floria-wk-card-switch 切到独立的「编译日志」卡；
+   单开（无 parent）时退回页面内日志工具（本文件仍往 toolbar.js 注册 'ver'/'log' 两枚）。 */
 (function () {
   'use strict';
   const F = window.Floria;
@@ -10,6 +10,7 @@
 
   const S = {
     book: '',            // 当前书稿名（= /api/books 里的 name）
+    texName: '',         // 主 .tex 文件名（/api/books 的 texName；切日志卡时拼 path 用）
     pdfMtime: 0,
     busy: false,
     recs: [],            // 编译历史（日志/版本共用）：{ts, ok, elapsed, pages, by, error, log}，新→旧
@@ -236,7 +237,8 @@
   function loadPdf(soft, keep) {
     if (!window.PdfView) return Promise.resolve();
     const v = S.pdfMtime || Date.now();
-    return PdfView.load('api/pdf?book=' + encodeURIComponent(S.book) + '&v=' + v, (cur, total) => {
+    // API 基准在 <base>/api/（卡片在 <base>/<cardId>/ 下），不能直接用相对地址
+    return PdfView.load(F.apiUrl('api/pdf?book=' + encodeURIComponent(S.book) + '&v=' + v), (cur, total) => {
       $('pdf-page-ind').textContent = cur + ' / ' + total;
       markToc();                   // 目录抽屉开着时，高亮跟着翻页走
       emitState();                 // 翻页 = 状态变化（emitState 自带去重）
@@ -274,7 +276,17 @@
       await loadPdf(false, true);            // 保持当前页码/缩放
     } else {
       setState('err');
-      applyToolTab('log', true);   // 编译失败 → 自动摊开日志卡（force：已在日志上也要保留）
+      // 编译失败 → 切到独立的「编译日志」卡（y=宿主顶栏随之落到日志 tab）。
+      // 单开（没有 parent）时退回本页日志工具，保持原行为。
+      const payload = {
+        book: S.book,
+        path: S.book + '/' + (S.texName || 'main.tex'),
+        error: r.error || '编译失败',
+        ts: Date.now() / 1000,
+      };
+      if (!(F.bridge.embedded() && F.bridge.switchCard('log', payload))) {
+        applyToolTab('log', true);   // force：已在日志上也要保留
+      }
       F.toast('编译失败：' + (r.error || '见日志'));
     }
     emitState();
@@ -339,6 +351,16 @@
     };
     B.onNote('floria-pv-broadcast', d => { if (d.ev === 'file-open') onFileOpen(d); });
     B.onNote('floria-pv-event', d => { if (d.ev === 'file-open') onFileOpen(d); });
+    // 多卡片切换：宿主在 iframe load 后下发 floria-wk-card-init{card,payload}。
+    // 从日志卡「返回 PDF」会带 {path}；直接点 PDF tab 则无 payload——恢复上次打开的那篇，别退回空态。
+    B.onNote('floria-wk-card-init', d => {
+      const p = (d && d.payload) || {};
+      const name = String(p.book || '') || bookFromPath(p.path || '');
+      if (name) { openBook(name); return; }
+      let last = '';
+      try { last = localStorage.getItem('florialatex.lastbook') || ''; } catch (e) { /* 隐私模式：忽略 */ }
+      if (last) openBook(last);
+    });
     B.onCmd('page', d => {                       // {page} 在当前书稿内翻页（1 基）
       const n = parseInt(d.page, 10);
       if (!window.PdfView || !Number.isFinite(n)) throw new Error('page 参数非法');
@@ -385,6 +407,8 @@
     if (!name) { close(); return; }                 // 空名 = 回到空态（无书稿打开）
     if (S.book === name) return;                     // 已是当前篇：幂等（宿主重复广播不重载）
     S.book = name;
+    S.texName = '';
+    try { localStorage.setItem('florialatex.lastbook', name); } catch (e) { /* 隐私模式：忽略 */ }
     S.pdfMtime = 0;
     setState('none');
     applyToolTab('');
@@ -397,7 +421,9 @@
     let info = null;
     try {
       const books = await F.api('api/books');
-      info = (books.find(b => b.name === name) || {}).pdf || null;
+      const b0 = books.find(b => b.name === name) || {};
+      info = b0.pdf || null;
+      if (b0.texName) S.texName = b0.texName;
     } catch (e) { /* 状态取不到：只当没 PDF，不弹提示（目录页已负责服务器不可达的文案） */ }
     if (info && info.exists) {
       S.pdfMtime = info.mtime || 0;         // 记下当前 PDF mtime：轮询据此判「外部编译产出新 PDF」
@@ -443,6 +469,7 @@
   function close() {
     stopWatch();
     S.book = '';
+    S.texName = '';
     S.busy = false;
     S.recs = [];
     if (window.PdfView) PdfView.destroy();
@@ -470,9 +497,13 @@
       : '打开项目里的任意一篇 .tex（或直接起一篇已编译的书稿），这里会显示它的 PDF。');
     showEmpty(true);
 
-    /* 注册两枚工具（本页工具栏的**全部** tab 来源，顺序 = 注册顺序） */
-    T.registerTool({ id: 'ver', title: '版本', pane: 'tool-ver', mount: renderVerPane });
-    T.registerTool({ id: 'log', title: '日志', pane: 'tool-log', mount: renderLogPane });
+    /* 页内工具（版本/日志）只在**单开**时注册。
+       多卡片架构下，日志已经是宿主顶栏的一张独立卡（log/），若再把页内工具申报给宿主工具栏，
+       顶栏会同时挂着「版本/日志」——切到编译日志卡时随帧消失，留下一跳变。桥接态一律不注册。 */
+    if (!F.bridge.embedded()) {
+      T.registerTool({ id: 'ver', title: '版本', pane: 'tool-ver', mount: renderVerPane });
+      T.registerTool({ id: 'log', title: '日志', pane: 'tool-log', mount: renderLogPane });
+    }
 
     $('tool-tabs').addEventListener('click', e => {
       const b = e.target.closest('[data-tool]');

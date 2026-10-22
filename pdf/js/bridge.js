@@ -33,6 +33,15 @@
     if (typeof cmd === 'string' && cmd && typeof fn === 'function') HANDLERS.set(cmd, fn);
   }
 
+  // 卡 → 宿主：请宿主把预览区切到另一张卡（多卡片架构，2026-10-18）。
+  //   {type:'floria-wk-card-switch', card:'log', payload:{...}}
+  // 宿主校验 e.source 与卡表后换 iframe src；目标卡加载后经 floria-wk-card-init 收到 payload。
+  function switchCard(card, payload) {
+    const m = { type: 'floria-wk-card-switch', card: String(card || '') };
+    if (payload !== undefined) m.payload = payload;
+    return send(m);
+  }
+
   // 宿主 → 卡 的「通知」面（区别于命令：不配对、不回 ack，只是事实广播）。
   //   · floria-pv-event   —— 宿主对我（本卡）说的、无配对的消息
   //   · floria-pv-broadcast —— 宿主对**所有在场卡**说的广播（如「用户打开了某文件」）
@@ -53,6 +62,8 @@
     if (!EMBEDDED || e.source !== window.parent) return;
     const d = e.data;
     if (!d || typeof d !== 'object') return;
+    // 宿主在目标卡 iframe load 后下发的一次性初始化上下文（多卡片切换带过来的 payload）
+    if (d.type === 'floria-wk-card-init') { dispatchNote(d.type, d); return; }
     if (d.type === 'floria-pv-event' || d.type === 'floria-pv-broadcast') { dispatchNote(d.type, d); return; }
     if (d.type !== 'floria-pv-cmd') return;
     const cmd = String(d.cmd || '');
@@ -65,5 +76,5 @@
     );
   });
 
-  F.bridge = { embedded: () => EMBEDDED, send, emit, onCmd, onNote };
+  F.bridge = { embedded: () => EMBEDDED, send, emit, onCmd, onNote, switchCard };
 })();
