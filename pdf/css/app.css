@@ -1,0 +1,267 @@
+/* ============================================================
+   Floria LaTeX v2 — 单界面（纯 PDF 预览卡；无目录页）
+   纯黑白极简、无彩色；token 沿用旧版（--plane / --radius / --gap）
+   观感照 Prism（PDF 为主体）；打开哪篇由宿主广播 / 卡片命令驱动
+   ============================================================ */
+:root {
+  --bg: #FFFFFF;
+  --bg-soft: #F4F4F4;
+  --panel: #FFFFFF;
+  --border: #E2E2E2;
+  --border-soft: #EFEFEF;
+  --border-strong: #C9C9C9;
+  --ink: #111111;
+  --ink-soft: #6B6B6B;
+  --ink-faint: #A0A0A0;
+  --accent: #111111;
+  --accent-deep: #000000;
+  --accent-soft: #EDEDED;
+  --accent-fg: #FFFFFF;
+  --desk: #EFEFEF;          /* PDF 井底（页浮动其上的那层） */
+  --plane: #E7E7E7;         /* 底板：缝里露出的就是它 */
+  --hover: #F2F2F4;
+  --radius: 14px;
+  --gap: 10px;
+  --shadow: 0 1px 3px rgba(0, 0, 0, .06), 0 8px 28px rgba(0, 0, 0, .07);
+  --serif: Georgia, "Times New Roman", "STIX Two Text", "Source Han Serif SC", "Noto Serif CJK SC", SimSun, serif;
+  --sans: "Segoe UI", "Microsoft YaHei UI", -apple-system, "PingFang SC", sans-serif;
+  --mono: Consolas, "JetBrains Mono", "Cascadia Mono", monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 14px;
+  overflow: hidden;
+}
+.hidden { display: none !important; }
+button { font-family: inherit; cursor: pointer; }
+
+/* ---------- 通用小件 ---------- */
+.icon-btn {
+  width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid transparent; background: transparent; color: var(--ink-soft); border-radius: 8px;
+}
+.icon-btn:hover { background: var(--accent-soft); color: var(--ink); }
+
+/* ============================================================
+   唯一视图：满屏 PDF（无目录页）
+   ============================================================ */
+#view-viewer { position: fixed; inset: 0; background: var(--desk); }
+
+/* 空态：没有任何书稿被打开时铺在视图区（PDF 页一渲出来就被 #pdf-pages 盖住，无需显隐） */
+#view-empty {
+  position: absolute; top: 48px; left: 0; right: 0; bottom: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 24px; text-align: center; background: var(--desk); z-index: 0;
+  pointer-events: none;
+}
+#view-empty .ve-title { font-family: var(--serif); font-size: 16px; font-weight: 600; color: var(--ink-soft); }
+#view-empty .ve-hint { font-size: 12.5px; color: var(--ink-faint); line-height: 1.7; max-width: 320px; }
+
+/* PDF 井从顶栏下沿开始（顶栏是通栏实体条，PDF 不从它底下穿过） */
+/* 注意：这里**不设** scroll-snap-type —— 见下方触屏媒体查询。
+   井里放 snap 时 Chrome 对鼠标滚轮是「先滚 delta、再单独跑一段 snap 动画」的两段式：
+   一格滚轮 = 滚到 +100 后被 snap 拉回，视觉上就是「滚一格滑两下」（实测 井宽700/页高933/视口852
+   → 净位移只有 81；井宽650/页高863 → 净位移 11；页高 < 视口时净位移 0 = 滚不动）。
+   井宽够大（页高 ≫ 视口）时 proximity 本就等于空转（净位移恒为 100，与关掉 snap 完全一致），
+   即桌面端 snap 只有「空转」和「打架」两种结果 → 鼠标/触控板一律不设，触屏才保留页首对齐。 */
+#pdf-scroll {
+  position: absolute; top: 48px; left: 0; right: 0; bottom: 0; overflow: auto; background: var(--desk);
+  -webkit-overflow-scrolling: touch; touch-action: pan-y pan-x;
+}
+@media (hover: none) and (pointer: coarse) {
+  #pdf-scroll { scroll-snap-type: y proximity; }   /* 触屏：垂直翻页，页首对齐 */
+}
+#pdf-pages {
+  display: flex; flex-direction: column; gap: 18px; padding: 20px;
+  align-items: safe center;          /* 适宽时水平居中；放大超出井宽时退化为靠左（左缘可达） */
+}
+.pv-page {
+  flex: 0 0 auto; background: #fff; box-shadow: 0 2px 16px rgba(0, 0, 0, .16);
+  border-radius: 2px; overflow: hidden; scroll-snap-align: start; position: relative;
+  cursor: crosshair;                 /* 点击 = 跳转源码 */
+}
+.pv-page canvas { display: block; }
+.pv-mark {
+  position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+  border: 2px solid #111; border-radius: 50%; pointer-events: none;
+  animation: pv-mark-out .9s ease forwards;
+}
+@keyframes pv-mark-out {
+  0% { transform: scale(.5); opacity: .9; }
+  100% { transform: scale(1.9); opacity: 0; }
+}
+
+/* 顶栏：**通栏白条**（照 Prism 的 PDF 预览列——白面 + 底边一条发丝线），不浮在 PDF 上。
+   条上两处：左＝文章目录（图标），右＝编译 / 界面调整（用户 2026-10-12 定案；「← 目录」已删）。 */
+.v-top {
+  position: absolute; top: 0; left: 0; right: 0; height: 48px; z-index: 12;
+  display: flex; align-items: center; gap: 8px; padding: 0 12px;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+}
+/* 右侧组（编译 / 界面调整）——margin-left:auto 把它推到条的最右 */
+.vt-right { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+/* 按钮：**隐藏式边界（幽灵）**——无描边无底色，hover 才浮出浅底；「编译」是唯一吃墨的实心胶囊 */
+.vt-btn {
+  display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; background: transparent;
+  color: var(--ink-soft); border-radius: 999px; padding: 5px 12px; font-size: 12.5px; white-space: nowrap;
+}
+.vt-btn:hover { border-color: transparent; background: var(--accent-soft); color: var(--ink); }
+.vt-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; padding: 5px 15px; }
+.vt-btn.primary:hover { background: var(--accent-deep); border-color: var(--accent-deep); color: var(--accent-fg); }
+#v-compile:disabled { opacity: .55; cursor: default; }
+/* 顶栏图标按钮（文章目录入口）：同为幽灵形态，方形浅底 */
+.vt-icon {
+  display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px;
+  border: 0; background: transparent; color: var(--ink-soft); border-radius: 8px;
+}
+.vt-icon:hover { background: var(--accent-soft); color: var(--ink); }
+.vt-icon.on { background: var(--accent-soft); color: var(--ink); }
+
+/* 工具 tab 条（内容由 js/toolbar.js 渲染；贴在工具卡卡头，观感照 Prism 的 工具面板 tab 条）
+   —— 扁平文字 tab（不是浮条胶囊）：active = 文字加深 + 底部一条 1.5px 下划线 */
+.v-tooltabs {
+  display: flex; align-items: center; gap: 16px; padding: 0;
+  flex: 1 1 auto; min-width: 0; overflow: hidden;
+}
+/* 被宿主接管时本页 tab 条为空 → 不占位，标题回落成左对齐（否则空 tab 条把标题挤到中间） */
+.v-tooltabs:empty { flex: 0 0 auto; }
+.v-tool-tab {
+  border: none; background: none; color: var(--ink-faint); border-radius: 0;
+  padding: 0 0 7px; font-size: 13px; white-space: nowrap; border-bottom: 1.5px solid transparent;
+}
+.v-tool-tab:hover { color: var(--ink); }
+.v-tool-tab.on { color: var(--ink); font-weight: 600; border-bottom-color: var(--ink); }
+
+/* 缩放 */
+.v-zoomwrap { position: relative; }
+#pdf-zoom-label { min-width: 40px; text-align: center; font-variant-numeric: tabular-nums; }
+.zcaret { font-size: 10px; line-height: 1; }
+#zoom-panel {
+  position: absolute; top: calc(100% + 8px); right: 0; width: 248px; padding: 12px; z-index: 70;
+  display: flex; flex-direction: column; gap: 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow);
+}
+.zp-row { display: flex; gap: 6px; }
+.zp-row button {
+  flex: 1; padding: 5px 0; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); color: var(--ink-soft); font-size: 12px;
+}
+.zp-row button:hover { color: var(--accent-deep); background: var(--accent-soft); border-color: var(--border-strong); }
+.zp-row button.on { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.zp-slider { display: flex; align-items: center; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border); }
+#pdf-zoom-range { flex: 1; accent-color: var(--ink); }
+#pdf-zoom-val { min-width: 44px; text-align: right; font-size: 12px; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+
+/* 底浮条：翻页胶囊 */
+#pdf-nav { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 12; }
+.pv-caps {
+  display: flex; align-items: center; gap: 2px; padding: 2px 6px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 999px; box-shadow: var(--shadow);
+}
+.pv-caps button {
+  width: 22px; height: 22px; border: none; background: none; border-radius: 50%;
+  color: var(--ink-soft); font-size: 15px; line-height: 1; display: flex; align-items: center; justify-content: center;
+}
+.pv-caps button:hover { background: var(--accent-soft); color: var(--accent-deep); }
+#pdf-page-ind { font-size: 12px; min-width: 64px; text-align: center; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+
+/* ---------- 目录抽屉（PDF 自带书签，Edge 式章节跳转） ---------- */
+/* 入口 = 顶栏左侧那枚 .vt-icon#toc-toggle（2026-10-12 从 PDF 左上角浮按钮挪进顶栏，改幽灵形态）；
+   抽屉盖在 PDF 井上，井不重排（PDF 不因此重渲染） */
+#toc-drawer {
+  position: absolute; top: 48px; left: 0; bottom: 0; width: 264px; z-index: 13;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--panel); border-right: 1px solid var(--border);
+}
+.toc-head {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 12px 10px 8px 16px; border-bottom: 1px solid var(--border-soft);
+}
+.toc-title { font-size: 13px; font-weight: 600; }
+.toc-body { flex: 1; overflow: auto; padding: 8px 8px 20px; }
+/* 树形列表行（缩进表层级），不是小卡 */
+.toc-item {
+  display: flex; align-items: baseline; gap: 8px;
+  width: 100%; text-align: left; border: none; background: none;
+  padding: 5px 8px; border-radius: 6px; font-size: 12.5px; line-height: 1.45;
+  color: var(--ink-soft);
+}
+/* 长标题省略、页码恒贴右（float 写法遇长标题会把页码挤到下一行） */
+.toc-t { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toc-item:hover { background: var(--hover); color: var(--ink); }
+.toc-item.on { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
+.toc-item.off { opacity: .45; }        /* 解析不出目标页的条目：列出但不可点 */
+.toc-item.lv1 { color: var(--ink); font-weight: 600; }
+.toc-item.lv2 { padding-left: 22px; }
+.toc-item.lv3 { padding-left: 36px; }
+.toc-item.lv4 { padding-left: 50px; }
+.toc-pg { flex: 0 0 auto; color: var(--ink-faint); font-variant-numeric: tabular-nums; font-weight: 400; }
+
+/* PDF 内链（Link 注释铺成的可点层，见 js/pdfview.js attachLinks） */
+.pv-links { position: absolute; inset: 0; }
+.pv-link { position: absolute; display: block; border-radius: 2px; cursor: pointer; box-sizing: border-box; }
+.pv-link:hover { background: rgba(17, 17, 17, .07); }
+
+/* ---------- 工具面板（版本 / 日志） ---------- */
+/* 展开 = **占满整块视图区**（照 Floria work 右栏自带的那枚「评论」工具页：工具页就是一整列）。
+   不是盖在 PDF 上的浮卡——那样面板区域底下还露着 PDF；本帧是工具内容的唯一载体（编译日志只活在本页内存里），
+   宿主又为帧工具保着预览帧在场，所以「整列」= 在本帧内铺满。 */
+#side-card {
+  position: absolute; inset: 0; z-index: 14;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--panel);
+}
+.sc-head {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 12px 10px 0 16px; border-bottom: 1px solid var(--border-soft);
+}
+.sc-title { font-size: 13px; font-weight: 600; color: var(--ink); flex: 1 1 auto; }
+.sc-body { flex: 1; overflow: auto; padding: 0 10px 16px; }
+.tool-pane { display: block; }
+
+/* pane 内的小节头（Prism 工具面板里「原始日志」那种分节标签） */
+.pane-sec { display: flex; align-items: baseline; gap: 8px; padding: 14px 6px 6px; }
+.pane-sec-title { font-size: 11.5px; font-weight: 600; color: var(--ink-faint); letter-spacing: .4px; text-transform: none; }
+.pane-sec-note { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+
+.pane-empty { padding: 44px 6px; text-align: center; }
+.pe-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.pe-hint { font-size: 12.5px; color: var(--ink-faint); line-height: 1.7; }
+
+/* 日志行：不是一张张小卡，是一条条发丝分隔的列表行（照 Prism 面板的列表感） */
+.log-row {
+  padding: 9px 6px; border-bottom: 1px solid var(--border-soft); border-radius: 6px; cursor: pointer;
+}
+.log-row:hover { background: var(--hover); }
+.log-row.bad .log-mark { color: var(--ink); }
+.log-head { display: flex; align-items: baseline; gap: 8px; }
+.log-mark { font-size: 12px; font-weight: 700; flex: 0 0 auto; }
+.log-time { font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--ink-soft); flex: 0 0 auto; }
+.log-el { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+.log-brief { font-size: 12.5px; color: var(--ink-soft); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-body {
+  margin-top: 8px; padding: 8px; max-height: 320px; overflow: auto;
+  background: var(--bg-soft); border-radius: 8px;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-all;
+}
+.log-by {
+  font-size: 10.5px; color: var(--ink-faint); border: 1px solid var(--border-soft);
+  border-radius: 4px; padding: 0 4px; flex: 0 0 auto; line-height: 1.6;
+}
+/* 版本行：摘要不展开原始 log（那归日志），页数/耗时缩进一行贴在成败下 */
+.ver-row { cursor: default; }
+.ver-meta { display: flex; gap: 14px; margin-top: 3px; padding-left: 20px;
+  font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+
+/* ---------- toast ---------- */
+#toast {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); z-index: 90;
+  background: var(--ink); color: var(--bg); padding: 8px 16px; border-radius: 999px;
+  font-size: 13px; box-shadow: var(--shadow); max-width: 70vw;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}

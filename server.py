@@ -1,0 +1,922 @@
+# -*- coding: utf-8 -*-
+"""Floria LaTeX 本地服务器（纯 Python 标准库，零依赖）。
+
+用法（或直接双击同目录 启动.bat）：
+    python server.py [--port 8765] [--root BOOKS_DIR] [--no-open]
+
+作用：像 Pj15 一样由本地进程直接读盘——页面经 http://127.0.0.1:<port> 打开后
+自动列出/加载书稿文件夹（含图片），零弹窗；Ctrl+S 保存经 /api/write 写回磁盘真实文件。
+
+安全边界：
+- 只绑定 127.0.0.1，不监听外网
+- 静态文件只出自 app/ 目录；书稿目录只出自 --root 下「递归扫到的含 .tex 目录」白名单
+  （书稿名由发现结果反查，外部传入的名字不在白名单即 404，天然防目录穿越）
+- 文件名一律取 basename，拒绝 '..'；写回只允许覆盖已存在的 .tex
+"""
+import argparse
+import bisect
+import gzip
+import json
+import os
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp'}
+
+CONTENT_TYPES = {
+    '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
+    '.bmp': 'image/bmp', '.woff': 'font/woff', '.woff2': 'font/woff2',
+    '.ttf': 'font/ttf', '.ico': 'image/x-icon', '.map': 'application/json',
+    '.pdf': 'application/pdf',
+}
+
+BOOKS_ROOT = None  # 运行时由 main() 设定
+COMPILE_LOCK = threading.Lock()  # 全局同时只跑一个编译（书稿大，避免 CPU 叠爆）
+
+# 递归发现书稿时跳过的目录名（隐藏目录另按前缀 '.' 跳过）
+SKIP_DIRS = {'node_modules', '__pycache__', 'venv', '.venv', 'site-packages'}
+
+
+def is_temp_dir(name):
+    """工作区临时任务目录命名 YYYYMMDDHHMMSS-名称（其中的 .tex 多为测试夹具，不算书稿）。"""
+    return len(name) > 15 and name[:14].isdigit() and name[14] == '-'
+
+
+def discover_books():
+    """递归扫描根目录下「含 .tex 文件」的目录 → 书稿列表（每个目录=一篇文章）。
+
+    跳过：隐藏目录（.build/.git/…）、node_modules/__pycache__ 等构建垃圾、
+    工作区临时任务目录（YYYYMMDDHHMMSS-名称，其中的 .tex 多为测试夹具）；
+    根目录自身直接放的 .tex 不算书稿（工作区规则本就禁止根目录散文件）。
+    书稿名 = 相对根目录的 POSIX 路径（可含 '/'，如 'papers/2026-xxx'），卡片直接显示。
+    mtime = 该目录主 .tex 的修改时间（int 毫秒，与 book_pdf_info 一致；取不到退目录 mtime，再退 0）。
+    """
+    books = []
+    root_abs = os.path.abspath(BOOKS_ROOT)
+    for cur, dirs, files in os.walk(root_abs):
+        dirs[:] = [d for d in dirs
+                   if not d.startswith('.') and d not in SKIP_DIRS and not is_temp_dir(d)]
+        if os.path.abspath(cur) == root_abs:
+            continue  # 根目录自身不算书稿
+        texs = sorted(f for f in files if f.lower().endswith('.tex') and not f.startswith('.'))
+        if not texs:
+            continue
+        lower = [f.lower() for f in texs]
+        tex_name = texs[lower.index('main.tex')] if 'main.tex' in lower else texs[0]
+        images = sorted(f for f in files
+                        if os.path.splitext(f)[1].lower() in IMG_EXT and not f.startswith('.'))
+        rel = os.path.relpath(cur, root_abs).replace(os.sep, '/')
+        try:
+            mt = os.path.getmtime(os.path.join(cur, tex_name))
+        except OSError:
+            try:
+                mt = os.path.getmtime(cur)
+            except OSError:
+                mt = 0
+        books.append({'name': rel, 'texName': tex_name, 'images': images, 'mtime': int(mt * 1000)})
+    books.sort(key=lambda b: b['name'])
+    return books
+
+
+def find_book(name):
+    for b in discover_books():
+        if b['name'] == name:
+            return b
+    return None
+
+
+def book_pdf_path(name):
+    """成品 PDF 的唯一落点 = 书稿根的 `main.pdf`（2026-10-11 起「成品与中间产物分离」）。
+
+    中间产物（.aux/.log/.out/.toc/.xdv/.fls/.fdb_latexmk/.synctex.gz）全在 `<书稿>/.build/`，
+    只有成品 PDF 出到书稿根 —— 与书稿目录里「PDF 与 main.tex 并排」的既有约定一致，
+    `.build/` 因此可以整个删掉重建而不碰成品。
+    """
+    return os.path.join(BOOKS_ROOT, name, 'main.pdf')
+
+
+def book_synctex_path(name):
+    """「点 PDF 跳源码」用的 synctex —— latexmk 把它跟成品 PDF 一起输出到书稿根。"""
+    return os.path.join(BOOKS_ROOT, name, 'main.synctex.gz')
+
+
+def newest_tex_mtime(book_name):
+    """书稿目录下所有 .tex 的最新 mtime（含分章子目录，跳过 .build/隐藏目录）。
+
+    拆分后正文在 sectionN/content.tex，只改章节文件不会碰主 .tex；只看 main.tex 会把
+    已过期的 PDF 误判成 fresh（2026-10-21）。
+    """
+    base = os.path.join(BOOKS_ROOT, book_name)
+    newest = 0.0
+    for cur, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__')]
+        for f in files:
+            if f.lower().endswith('.tex') and not f.startswith('.'):
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(cur, f)))
+                except OSError:
+                    pass
+    return newest
+
+
+def book_pdf_info(b):
+    """书稿的 PDF 编译产物状态：exists=有 main.pdf；fresh=pdf 比任何 .tex 新（无需重编）。"""
+    pdf_p = book_pdf_path(b['name'])
+    if not os.path.isfile(pdf_p):
+        return {'exists': False, 'fresh': False, 'mtime': 0}
+    tex_mtime = newest_tex_mtime(b['name']) or os.path.getmtime(
+        os.path.join(BOOKS_ROOT, b['name'], b['texName']))
+    fresh = os.path.getmtime(pdf_p) >= tex_mtime - 1
+    return {'exists': True, 'fresh': fresh, 'mtime': int(os.path.getmtime(pdf_p) * 1000)}
+
+
+# ---------- 编译历史（「日志」「版本」两枚工具的统一数据源） ----------
+# 落盘 = <书稿>/.build/compile-history.jsonl，一行一条 JSON：
+#   {ts, ok, elapsed, pages, by, error, log}
+#     ts      = 编译完成时刻（epoch 秒，float）
+#     ok      = 是否成功
+#     elapsed = 耗时（秒，float）；回溯补的记录拿不到给 null
+#     pages   = 成品页数（抓 "Output written on … (N pages)"）；抓不到给 null
+#     by      = 来源：'page'（本页点「编译」）/ 'ai'（会话里跑 compile_book.py）
+#               / 'disk'（本功能上线前编的，由磁盘产物回溯）
+#     error   = 失败首行；log = 原始日志（截断）
+# 两个写入方写同一格式 ⇒ 前端「日志」「版本」读 GET /api/history 即可，天然合流、按时间排序。
+LEDGER_NAME = 'compile-history.jsonl'
+LEDGER_MAX = 200            # 只回最近 N 条；文件本身只追加不裁剪（避免并发读改写）
+
+
+def ledger_path(name):
+    return os.path.join(BOOKS_ROOT, name, '.build', LEDGER_NAME)
+
+
+def ledger_append(name, rec):
+    """追加一条编译记录（只追加，短行写靠 'a' 的原子性，无需锁）。"""
+    p = ledger_path(name)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    except OSError:
+        pass
+
+
+def pages_in(text):
+    """从编译输出里抓成品页数：优先 'Output written on …pdf (N pages)'，退其次任意一条。"""
+    if not text:
+        return None
+    best = None
+    for m in re.finditer(r'Output written on ([^\n(]*?)\((\d+)\s+pages?', text):
+        if m.group(1).lower().endswith('.pdf'):
+            return int(m.group(2))
+        best = int(m.group(2))
+    return best
+
+
+def _scrape_log(logpath):
+    """从 .build/main.log 抓「上次编译」的成败与页数（供账本为空时回溯补一条）。"""
+    try:
+        with open(logpath, 'r', encoding='utf-8', errors='replace') as f:
+            txt = f.read()
+    except OSError:
+        return (None, None)
+    ok = ('Output written on' in txt and 'Fatal error occurred' not in txt
+          and 'Emergency stop' not in txt)
+    return (ok, pages_in(txt))
+
+
+def _backfill(name, recs):
+    """账本比磁盘编译痕迹旧 ⇒ 有绕过账本的编译（手工 latexmk / 其他脚本 / 失败编译）→ 补一条回溯。
+
+    权威兜底（2026-10-14 用户拍板：版本/日志链路必须全自动，不依赖谁记得写账）：
+    痕迹 mtime = max(main.pdf, .build/main.log, .build/main.fdb_latexmk)——失败的编译没有新 PDF，
+    但 main.log/.fdb 会更新。痕迹比账本最新 ts 新 1s 以上就补一条（补完账本里已有同 ts 记录，
+    下次读不再触发，自愈）。耗时无法回溯（null）；成败/页数从 .build/main.log 抓，抓不到给 null。
+    一次只补最新一条（连续多次绕账编译只留最近一次的痕，可接受）。
+    """
+    traces = [book_pdf_path(name),
+              os.path.join(BOOKS_ROOT, name, '.build', 'main.log'),
+              os.path.join(BOOKS_ROOT, name, '.build', 'main.fdb_latexmk')]
+    mt = 0.0
+    for p in traces:
+        try:
+            mt = max(mt, os.path.getmtime(p))
+        except OSError:
+            pass
+    if mt <= 0:
+        return recs
+    newest = max((r.get('ts') or 0) for r in recs) if recs else 0
+    if mt <= newest + 1:
+        return recs
+    ok, pages = _scrape_log(os.path.join(BOOKS_ROOT, name, '.build', 'main.log'))
+    rec = {'ts': round(mt, 3), 'ok': (ok if ok is not None else True), 'elapsed': None,
+           'pages': pages, 'by': 'disk', 'error': '', 'log': '（由磁盘产物回溯的编译记录）'}
+    ledger_append(name, rec)
+    recs.append(rec)
+    return recs
+
+
+def ledger_read(name):
+    """读账本（最近 LEDGER_MAX 条，**按时间倒序**：下标 0 = 最新）。坏行/空行跳过。"""
+    recs = []
+    try:
+        with open(ledger_path(name), 'r', encoding='utf-8', errors='replace') as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    recs.append(json.loads(ln))
+                except ValueError:
+                    continue
+    except OSError:
+        recs = []
+    recs = _backfill(name, recs)      # 兜底也覆盖「账本为空但磁盘有痕」：newest=0 必触发回溯
+    recs = recs[-LEDGER_MAX:]
+    recs.reverse()
+    return {'ok': True, 'records': recs}
+
+
+# ---------- 内置编译链定位（MiKTeX Portable 随 preview/tex/ 携带） ----------
+# 编译工具优先用**项目自带**的（APP_DIR/tex/ 下任意深度的同名可执行文件），
+# 找不到才回落系统 PATH —— 使本应用自包含：整体拷到别的机器无需另装 TeX。
+_TEX_TOOL_CACHE = {}
+
+
+def find_tex_tool(name):
+    """定位 TeX 工具：先项目自带 tex/<任意深度>/<name>(.exe)，再系统 PATH。结果缓存。"""
+    if name in _TEX_TOOL_CACHE:
+        return _TEX_TOOL_CACHE[name]
+    exe = (name + '.exe') if os.name == 'nt' else name
+    found = None
+    root = os.path.join(APP_DIR, 'tex')
+    # 快路径：MiKTeX Portable 的标准位置（省得对 40k+ 文件的全树 walk）
+    for rel in ('texmfs/install/miktex/bin/x64', 'texmfs/install/miktex/bin'):
+        cand = os.path.join(root, *rel.split('/'), exe)
+        if os.path.isfile(cand):
+            found = cand
+            break
+    if not found and os.path.isdir(root):
+        for cur, _dirs, files in os.walk(root):
+            for f in files:
+                if f.lower() == exe.lower():
+                    found = os.path.join(cur, f)
+                    break
+            if found:
+                break
+    if not found:
+        found = shutil.which(name)
+    _TEX_TOOL_CACHE[name] = found
+    return found
+
+
+# MiKTeX 的 latexmk.exe 只是**脚本引导器**，真正执行的是 latexmk.pl —— 必须有 perl 才能跑
+# （报错原文：MiKTeX could not find the script engine 'perl' which is required to execute 'latexmk'）。
+# MiKTeX Portable 自身不含 perl，故按「随卡片携带 → 工作区 .tools → 系统 PATH → Git/Strawberry 常见位置」找。
+_PERL_CACHE = {}
+
+
+def find_perl():
+    """定位 perl（latexmk 的脚本引擎）；找不到返回 None（调用方回落直驱 xelatex）。结果缓存。"""
+    if 'perl' in _PERL_CACHE:
+        return _PERL_CACHE['perl']
+    exe = 'perl.exe' if os.name == 'nt' else 'perl'
+    cands = [os.path.join(APP_DIR, 'tex', 'perl', 'bin', exe),   # 与 MiKTeX 同处一室（若装了便携 perl）
+             os.path.join(APP_DIR, 'tex', 'perl', exe)]
+    d = APP_DIR                                                  # 工作区便携约定：逐级向上找 .tools/perl
+    for _ in range(4):
+        nd = os.path.dirname(d)
+        if not nd or nd == d:
+            break
+        d = nd
+        cands.append(os.path.join(d, '.tools', 'perl', 'bin', exe))
+    w = shutil.which('perl')
+    if w:
+        cands.append(w)
+    g = shutil.which('git')                                      # Git for Windows 自带 usr/bin/perl.exe
+    if g:
+        cands.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(g))), 'usr', 'bin', exe))
+    cands += [r'C:\Program Files\Git\usr\bin\perl.exe',
+              r'C:\Program Files (x86)\Git\usr\bin\perl.exe',
+              r'C:\Strawberry\perl\bin\perl.exe',
+              os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'Git', 'usr', 'bin', 'perl.exe')]
+    found = next((c for c in cands if c and os.path.isfile(c)), None)
+    _PERL_CACHE['perl'] = found
+    return found
+
+
+def _hoist_outputs(book_dir):
+    """把误落在 .build/ 里的成品搬回书稿根（latexmk -auxdir 已自己搬，此处兜直驱回落路径）。"""
+    for f in ('main.pdf', 'main.synctex.gz'):
+        src = os.path.join(book_dir, '.build', f)
+        dst = os.path.join(book_dir, f)
+        if os.path.isfile(src) and (not os.path.isfile(dst) or os.path.getmtime(src) > os.path.getmtime(dst)):
+            try:
+                shutil.move(src, dst)
+            except OSError:
+                pass
+
+
+def _pdf_pages(pdf_p):
+    """pdfinfo 数成品页数（便携链自带）；拿不到给 None（前端显示「—」）。"""
+    exe = find_tex_tool('pdfinfo')
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, pdf_p], capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=60,
+                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        for ln in p.stdout.splitlines():
+            if ln.lower().startswith('pages:'):
+                return int(ln.split(':', 1)[1].strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def run_compile(b):
+    """latexmk -xelatex 编译书稿 → **书稿根的 main.pdf**（引擎优先用项目自带的 MiKTeX）。
+
+    带 -synctex=1：产出书稿根的 main.synctex.gz，供「点 PDF 跳转源码」用。
+    **成品与中间产物分离**（2026-10-11）：`-auxdir=.build` ⇒ 中间产物（aux/log/out/toc/xdv/
+    fls/fdb_latexmk）全进 `<书稿>/.build/`，只有成品 PDF 与 synctex 出到书稿根 ⇒ `.build/`
+    可整个删掉重建而不碰成品。
+    **引擎选 xelatex 不选 lualatex**（2026-10-11 定案）：ctex/ctexbook 在 LuaTeX 下走 luatexja，
+    要 require 几十个 ltj-*.lua，每次模块查找约 0.25s ⇒ 每次编译固定先烧 ~21s，与字体/文档无关；
+    XeLaTeX 下走 xeCJK（C 实现），无这层。整本 MATH：lualatex 67.3s → xelatex 23.9s，
+    页数/版面/字体一致，synctex 同坐标命中行号完全相同。
+    根因报告与复检脚本见 .claude/neturon/neurons/Neuron-Pj18-LaTex论文书写/l3.raw/files/
+    的「编译引擎_lualatex慢的根因与xelatex切换.md」。**别再改回 lualatex。**
+    """
+    book_dir = os.path.join(BOOKS_ROOT, b['name'])
+    build_dir = os.path.join(book_dir, '.build')
+    os.makedirs(build_dir, exist_ok=True)
+    mk = find_tex_tool('latexmk')
+    tex = find_tex_tool('xelatex')
+    perl = find_perl()                       # latexmk 是 perl 脚本，没 perl 就跑不起来
+    use_mk = bool(mk and perl)
+    if not use_mk and not tex:
+        return {'ok': False, 'error': '未找到可用的 TeX 引擎（项目自带 tex/ 与系统 PATH 均无 xelatex）', 'log': '', 'time': 0}
+    env = os.environ.copy()
+    # git-bash 会导出 LANG=zh_CN.UTF-8 —— MiKTeX 自带 perl 在该 locale 下把带中文的脚本路径
+    # 转码失败（"Can't open perl script"，0.7s 即退，退出码 4294967295；2026-10-14 实测踩过）。
+    # 从 bash 起的临时实例/网关都会把 locale 传进来，编译子进程一律剥掉。
+    for k in ('LANG', 'LC_ALL', 'LC_CTYPE'):
+        env.pop(k, None)
+    if use_mk:
+        # 老书稿（改前编译的）没有 synctex，而 latexmk 会认为 PDF 是最新的直接跳过
+        # → 首次补一把 -g 强制全量，之后 synctex 已在，恢复增量（秒级）
+        force = [] if os.path.isfile(book_synctex_path(b['name'])) else ['-g']
+        cmd = [mk, '-xelatex', '-synctex=1'] + force + ['-interaction=nonstopmode', '-halt-on-error',
+                                                        '-file-line-error', '-auxdir=.build', b['texName']]
+        # MiKTeX 的 latexmk.exe 从 PATH 找 perl（网关拉起的后端 PATH 里常常没有）→ 显式补上
+        env['PATH'] = os.path.dirname(perl) + os.pathsep + env.get('PATH', '')
+    else:  # 没有 latexmk 或没有 perl → 直接驱动 xelatex 跑两遍（慢，但零外部依赖）
+        # 直驱没法只把 aux 分流，故全写 .build 再搬成品（_hoist_outputs）
+        cmd = [tex, '-synctex=1', '-interaction=nonstopmode', '-halt-on-error', '-file-line-error',
+               '-output-directory=.build', b['texName']]
+    chain = ('[编译链] latexmk -xelatex 增量（perl: %s）' % perl) if use_mk else \
+            '[编译链] xelatex 直驱两遍（未找到 perl，已跳过 latexmk；较慢）'
+    # 快速路径（2026-10-22）：拆分书稿 → 只编改动的章（并行）+ pypdf 拼接 + synctex 合并。
+    # 前提不满足或任何一步失败 → 返回 None，回落到下面的整本 latexmk（行为与旧版一致）。
+    skip = ''
+    try:
+        import fastbuild
+        fr = fastbuild.try_compile(book_dir, b['name'], mk, perl, env)
+        if not fr:
+            skip = getattr(fastbuild, 'LAST_SKIP', '') or ''
+    except Exception as ex:                 # noqa: BLE001
+        fr = None
+        skip = '快速路径异常：%s' % ex
+    if fr:
+        ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': True, 'elapsed': fr['time'],
+                                  'pages': fr.get('pages'), 'by': 'chapter', 'error': '',
+                                  'log': fr['log']})
+        return fr
+    if skip:
+        chain += '\n[编译链] 未走快速路径：' + skip
+    t0 = time.time()
+    flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    try:
+        p = subprocess.run(cmd, cwd=book_dir, timeout=420, capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', creationflags=flags, env=env)
+        second = None
+        if not use_mk and p.returncode == 0:  # 手动模式第二遍
+            second = subprocess.run(cmd, cwd=book_dir, timeout=420, capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', creationflags=flags, env=env)
+        elapsed = round(time.time() - t0, 1)
+        _hoist_outputs(book_dir)
+        pdf_p = book_pdf_path(b['name'])
+        if (second.returncode if second else p.returncode) == 0 and os.path.isfile(pdf_p):
+            log = ((second.stdout if second else p.stdout) or '') + '\n' + chain
+            pages = pages_in(log)
+            if pages is None:      # xelatex 的「Output written on …xdv」不进 latexmk stdout → 回退解析
+                _ok2, pages = _scrape_log(os.path.join(build_dir, 'main.log'))
+            if pages is None:
+                pages = _pdf_pages(pdf_p)
+            ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': True, 'elapsed': elapsed,
+                                      'pages': pages, 'by': 'page', 'error': '', 'log': log[-1200:]})
+            try:      # 整本编译成功后刷新按章缓存（前置页页数 + 各章 hash/页数）
+                import fastbuild
+                fastbuild.refresh_cache(book_dir)
+            except Exception:
+                pass
+            return {'ok': True, 'time': elapsed, 'mtime': int(os.path.getmtime(pdf_p) * 1000),
+                    'log': log[-1200:]}
+        log = ((second or p).stdout or '') + '\n' + ((second or p).stderr or '')
+        # 失败时提取关键错误行（LaTeX 的 ! 开头行 + file:line: 格式 + 脚本引擎缺失那类）
+        errs = [ln for ln in log.splitlines()
+                if ln.startswith('!') or ':error:' in ln or 'Emergency stop' in ln
+                or 'did not succeed' in ln or 'could not find' in ln]
+        tail = ('\n'.join(errs[-12:]) or log[-1500:]) + '\n' + chain
+        err = '编译失败（返回码 %d）' % (second or p).returncode
+        ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': False, 'elapsed': elapsed,
+                                  'pages': None, 'by': 'page', 'error': err, 'log': tail})
+        return {'ok': False, 'time': elapsed, 'log': tail, 'error': err}
+    except subprocess.TimeoutExpired:
+        elapsed = round(time.time() - t0, 1)
+        msg = '编译超时（420s）——首次编译装包或图形宏包可能太慢，可先在 VSCode 里编译一次'
+        ledger_append(b['name'], {'ts': round(time.time(), 3), 'ok': False, 'elapsed': elapsed,
+                                  'pages': None, 'by': 'page', 'error': msg, 'log': ''})
+        return {'ok': False, 'time': elapsed, 'error': msg, 'log': ''}
+
+
+# ---------- SyncTeX：PDF 坐标 → 源码行（点击 PDF 跳回源码） ----------
+# 记录格式（SyncTeX v1）：<类型><tag>,<line>[:<x>,<y>[:<width>,<height>,<depth>]]
+# 页面分块 '{<页码>' … '}<页码>'；坐标单位 sp（除以 65536 得 TeX pt，magnification 归一为 1000）
+#
+# ★ 坐标换算（2026-10-12 修正）：SyncTeX 的「pt」是 TeX pt（1/72.27 in），
+#   PDF/pdf.js 用的是 bp（1/72 in）——两者差一个 72/72.27 的比例；
+#   且头部 X/Y Offset（TeX 原点距纸角 1 in，记录值 4736287）是 **加**在记录值上的：
+#       bp = (raw + offset) * unit/65536 * 1000/mag * 72/72.27
+#   反解即 raw = bp/k - offset。旧写法 `raw = bp*65536 + offset` 既漏了 72/72.27、又把
+#   offset 的符号搞反了，导致每次点击都被当成偏低 ~144 bp 的位置 → 稳定跳到**后面十来行**
+#   （「源码映射存在偏移」的根因；换引擎后 offset 从 0 变成 4736287 才暴露）。
+SYNC_PT = 72.0 / 72.27                     # TeX pt → PDF bp
+SYNC_REC = re.compile(r'^(?P<t>[-\[\]()<>xkgvhr$!{}])(?:(?P<tag>-?\d+),(?P<line>-?\d+))?'
+                      r'(?::(?P<x>-?\d+),(?P<y>-?\d+))?(?::(?P<w>-?\d+),(?P<h>-?\d+),(?P<d>-?\d+))?')
+SYNC_CACHE = {'key': None, 'data': None}   # 单条缓存（当前书稿）
+SYNC_TOL = 2.0                             # 命中判定容差（bp）
+SYNC_LINE_MAX = 45.0                       # 「文本行级盒」高度上限（bp）：排除整页外框这类大盒
+SYNC_TRUST = 15                            # 命中盒与单调基准相差超过这么多行 → 判为伪记录
+
+
+def sync_k(data):
+    """记录值 → bp 的比例因子（含 TeX pt → bp）。"""
+    return data['unit'] / 65536.0 * (1000.0 / data['mag']) * SYNC_PT
+
+
+def _parse_synctex(path, tex_name, book_dir):
+    """解析 .synctex.gz，按页分组。
+
+    2026-10-22 起快速编译的 synctex 已把自动分章的块记录合并并改写成 main.tex，正常情况下
+    只会命中 main.tex。这里仍按多文件解析：SyncTeX 1.5 会把 Input 懒写在正文里，且块编译产物
+    藏在 .build/（路径含 . 开头段落 → 被过滤），留一套通用映射以备将来真有多文件书稿。
+    """
+    mag, unit, ox, oy = 1000.0, 1.0, 0.0, 0.0
+    inputs, pages, page = {}, {}, 0
+    root = 1
+
+    def add_input(raw):
+        nonlocal root
+        parts = raw.rstrip('\n').split(':', 2)
+        if len(parts) != 3:
+            return
+        try:
+            tag = int(parts[1])
+        except ValueError:
+            return
+        p = parts[2].strip()
+        if not os.path.isabs(p):
+            p = os.path.join(book_dir, p)
+        inputs[tag] = os.path.normpath(p)
+        if tex_name and os.path.basename(p).lower() == tex_name.lower():
+            root = tag
+
+    with gzip.open(path, 'rt', encoding='utf-8', errors='replace') as f:
+        for raw in f:                # 头部：Input / Magnification / Unit / Offset，直到 Content:
+            if raw.startswith('Content:'):
+                break
+            if raw.startswith('Input:'):
+                add_input(raw)
+            elif raw.startswith('Magnification:'):
+                mag = float(raw.split(':', 1)[1] or 1000) or 1000.0
+            elif raw.startswith('Unit:'):
+                unit = float(raw.split(':', 1)[1] or 1) or 1.0
+            elif raw.startswith('X Offset:'):
+                ox = float(raw.split(':', 1)[1] or 0)
+            elif raw.startswith('Y Offset:'):
+                oy = float(raw.split(':', 1)[1] or 0)
+        for raw in f:                # 正文
+            if not raw:
+                continue
+            c = raw[0]
+            if c == '{':
+                page = int(raw[1:])
+                pages.setdefault(page, [])
+                continue
+            if c == '}':
+                page = 0
+                continue
+            # ★ `\include` 的章节文件不在头部登记：SyncTeX 1.5 会把 `Input:<tag>:<path>`
+            #   懒写在正文里（且可能**排在它的记录之后**）⇒ 先收记录，末尾再按 tag 过滤。
+            if raw.startswith('Input:'):
+                add_input(raw)
+                continue
+            if page == 0:
+                continue
+            m = SYNC_REC.match(raw)
+            if not m:
+                continue
+            g = m.groupdict()
+            if g['tag'] is None or g['x'] is None:
+                continue
+            pages[page].append((int(g['line']), int(g['x']), int(g['y']),
+                                int(g['w'] or 0), int(g['h'] or 0), int(g['d'] or 0),
+                                int(g['tag'])))
+    base = os.path.abspath(book_dir)
+    files = {}
+    for tag, p in inputs.items():
+        ap = os.path.abspath(p)
+        try:
+            rel = os.path.relpath(ap, base)
+        except ValueError:           # 跨盘符
+            continue
+        segs = rel.replace(os.sep, '/').split('/')
+        if rel.startswith('..') or any(s.startswith('.') for s in segs):
+            continue
+        if not ap.lower().endswith('.tex'):
+            continue
+        files[tag] = '/'.join(segs)
+    for pg, recs in pages.items():
+        pages[pg] = [r for r in recs if r[6] in files]
+    return {'pages': pages, 'files': files, 'mag': mag, 'unit': unit,
+            'ox': ox, 'oy': oy, 'root': root}
+
+
+def load_synctex(path, tex_name, book_dir):
+    key = (path, os.path.getmtime(path), os.path.getsize(path))
+    if SYNC_CACHE['key'] != key:
+        SYNC_CACHE['key'], SYNC_CACHE['data'] = key, _parse_synctex(path, tex_name, book_dir)
+    return SYNC_CACHE['data']
+
+
+def _page_lines(data, page):
+    """取某页「可信的行级记录」，按 y（页面自上而下）排序，返回 (全部行级盒, 单调基准线)。
+
+    页眉/页脚/整页外框这类记录，TeX 在 shipout 时把它们记成「当前行」= 本页末尾的行号，
+    直接参与命中会把页边点击全拽到页尾。它们必然破坏「y 增大 → 行号增大」的顺序，
+    故取最长不减子序列作为该页的单调基准：命中行与基准相差过远即判为这类伪记录。
+    结果按页缓存（每页只算一次）。
+    """
+    cache = data.setdefault('lines', {})
+    if page in cache:
+        return cache[page]
+    recs = data['pages'].get(page) or []
+    hmax = SYNC_LINE_MAX / sync_k(data)
+    cands = [r for r in recs if r[3] > 0 and 0 < r[4] <= hmax]
+    if not cands:
+        cands = [r for r in recs if r[3] > 0] or recs
+    order = sorted(range(len(cands)), key=lambda i: cands[i][2])   # 按 y
+    tails, idxs, prev = [], [], [-1] * len(order)
+    for k, i in enumerate(order):
+        j = bisect.bisect_right(tails, cands[i][0])
+        if j == len(tails):
+            tails.append(cands[i][0]); idxs.append(k)
+        else:
+            tails[j] = cands[i][0]; idxs[j] = k
+        prev[k] = idxs[j - 1] if j else -1
+    keep, k = [], (idxs[-1] if idxs else -1)
+    while k >= 0:
+        keep.append(order[k]); k = prev[k]
+    keep.sort(key=lambda i: cands[i][2])
+    out = (cands, [cands[i] for i in keep])
+    cache[page] = out
+    return out
+
+
+def synctex_lookup(b, page, xpt, ypt):
+    """(书稿, 页号, PDF 坐标 pt·原点页面左上) → {'line', 'page', 'file'} 或 {'error': …}。
+
+    file = 命中行所属源文件（书稿相对 POSIX 路径，如 `section3/content.tex`）。
+    """
+    path = book_synctex_path(b['name'])
+    if not os.path.isfile(path):
+        return {'error': '还没有 synctex 数据——请点状态胶囊重新编译一次（编译已带 -synctex=1）'}
+    try:
+        data = load_synctex(path, os.path.basename(b['texName']),
+                            os.path.join(BOOKS_ROOT, b['name']))
+    except (OSError, EOFError, gzip.BadGzipFile) as e:
+        return {'error': 'synctex 解析失败：%s' % e}
+    page = int(page)
+    if not (data['pages'].get(page) or []):
+        return {'error': '本页无源码映射（封面 / 目录 / 纯图片页）'}
+    cands, mono = _page_lines(data, page)
+    if not cands:
+        return {'error': '本页无源码映射（封面 / 目录 / 纯图片页）'}
+    k = sync_k(data)                     # 记录值 → bp（含 TeX pt → bp）
+    vx, vy = xpt / k - data['ox'], ypt / k - data['oy']   # 头部 X/Y Offset 是加在记录值上的
+    tol = SYNC_TOL / k
+    # 该 y 处的「应有行号」：单调基准里离得最近的一条
+    ys = [r[2] for r in mono]
+    i = bisect.bisect_left(ys, vy)
+    ref = min(mono[max(0, i - 1):i + 1] or mono, key=lambda r: abs(r[2] - vy))
+    files = data.get('files') or {}
+
+    def out(line, tag):
+        return {'line': line, 'page': page,
+                'file': files.get(tag) or b['texName']}
+
+    best = None
+    for (line, x, y, w, h, d, tag) in cands:
+        # 盒内判定：x 向右、y 向下（高度在基线上方、depth 在下方）；最小盒 = 最内层，最精确
+        if w > 0 and (x - tol) <= vx <= (x + w + tol) and (y - h - tol) <= vy <= (y + d + tol):
+            area = w * max(h + d, 1)
+            if best is None or area <= best[0]:
+                best = (area, line, x, y, tag)             # 连 (x,y) 一起记，供下面同原点取最小行
+    if best is None:
+        return out(ref[0], ref[6])                         # 无盒命中（页边/纯图页）→ 正文最近行
+    # ★ 同一 (x,y) 原点的记录里取最小行号（2026-10-12）：外层行盒的行号是 \par 收尾时的
+    #   「当前行」，而它的内容记录（hbox/kern/glue）才带真正所在行 —— 外层行盒与首内容常共享
+    #   同一原点，取最小即回到真值行（残差 +1 的主因）。实测以 synctex.exe 为参照
+    #   （全本 MATH 每页抽 3 词，n=206）：完全一致 33%→39%、中位仍 +1、|Δ|≤2 98%。
+    same = [r[0] for r in (data['pages'].get(page) or [])
+            if r[1] == best[2] and r[2] == best[3] and r[6] == best[4]]
+    cand = min(same) if same else best[1]
+    # 页眉/页脚/大图上的 shipout 伪记录，其行号（= 本页末尾行）远离单调基准 → 被这条挡下，
+    # 回落「该 y 处的正文最近行」。故 margin_band 那条独立判据已被本判据覆盖，删去。
+    if abs(cand - ref[0]) <= SYNC_TRUST:
+        return out(cand, best[4])
+    return out(ref[0], ref[6])                             # 否则用最近的正文行（页边/大图/伪记录）
+
+
+NEW_BOOK_TEX = r"""\documentclass[UTF8]{ctexart}
+\usepackage{amsmath,amssymb,graphicx}
+\title{%(title)s}
+\author{}
+\date{\today}
+\begin{document}
+\maketitle
+
+\section{第一节}
+在这里开始写。
+\end{document}
+"""
+
+
+def create_book(name):
+    """在项目根下新建书稿目录 <name>/main.tex（递归发现随后即扫到它）。"""
+    name = (name or '').strip()
+    if not name:
+        return {'ok': False, 'error': '书稿名不能为空'}
+    if any(ch in name for ch in '\\/:*?"<>|') or name[0] == '.':
+        return {'ok': False, 'error': r'名字里不能有 \ / : * ? " < > | 或以 . 开头'}
+    if any(ord(ch) < 32 for ch in name):
+        return {'ok': False, 'error': '名字里有不可见控制字符，请删掉重输'}
+    if name.upper().split('.')[0] in {'CON', 'PRN', 'AUX', 'NUL'} or \
+       (len(name) >= 4 and name[:3].upper() in {'COM', 'LPT'} and name[3].isdigit()):
+        return {'ok': False, 'error': '这是 Windows 保留设备名，换一个名字'}
+    if name[-1] in '. ':
+        return {'ok': False, 'error': '名字不能以空格或点结尾'}
+    if len(name) > 60:
+        return {'ok': False, 'error': '名字太长（限 60 字内）'}
+    if is_temp_dir(name):
+        return {'ok': False, 'error': '这个名字形如工作区临时任务目录（时间戳-名称），会被书库扫描跳过，换个名字'}
+    d = os.path.join(BOOKS_ROOT, name)
+    if os.path.exists(d):
+        return {'ok': False, 'error': '同名书稿目录已存在'}
+    try:
+        os.makedirs(d)
+        with open(os.path.join(d, 'main.tex'), 'w', encoding='utf-8') as f:
+            f.write(NEW_BOOK_TEX % {'title': name})
+    except OSError as e:
+        return {'ok': False, 'error': str(e)}
+    return {'ok': True, 'name': name}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = 'FloriaLaTeX/0.5.0'
+
+    def log_message(self, fmt, *args):
+        if self.path.startswith('/api') or self.path.startswith('/img'):
+            sys.stderr.write('[%s] %s\n' % (self.log_date_time_string(), fmt % args))
+
+    # ---------- helpers ----------
+    def send_json(self, obj, code=200):
+        data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_file(self, path):
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+        except OSError:
+            self.send_json({'error': 'not found'}, 404)
+            return
+        ext = os.path.splitext(path)[1].lower()
+        self.send_response(200)
+        self.send_header('Content-Type', CONTENT_TYPES.get(ext, 'application/octet-stream'))
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_redirect(self, to):
+        self.send_response(302)
+        self.send_header('Location', to)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    # ---------- GET ----------
+    def do_GET(self):
+        path = posixpath.normpath(urllib.parse.unquote(self.path.split('?', 1)[0])).replace('\\', '/')
+        if path.startswith('/api/books'):
+            books = discover_books()
+            for b in books:          # 目录页要显示「已编译 / 未编译」，随列表一次带回，省得逐本再请求
+                b['pdf'] = book_pdf_info(b)
+            return self.send_json(books)
+        if path.startswith('/api/history'):
+            b = find_book(self.query().get('book', ''))
+            if not b:
+                return self.send_json({'ok': False, 'error': 'book not found'}, 404)
+            return self.send_json(ledger_read(b['name']))
+        if path.startswith('/api/read'):
+            qs = {}
+            if '?' in self.path:
+                for kv in self.path.split('?', 1)[1].split('&'):
+                    if '=' in kv:
+                        k, v = kv.split('=', 1)
+                        qs[k] = urllib.parse.unquote(v)
+            b = find_book(qs.get('book', ''))
+            if not b:
+                return self.send_json({'error': 'book not found'}, 404)
+            p = os.path.join(BOOKS_ROOT, b['name'], os.path.basename(b['texName']))
+            try:
+                with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+            except OSError as e:
+                return self.send_json({'error': str(e)}, 500)
+            return self.send_json({'texName': b['texName'], 'text': text, 'images': b['images'],
+                                   'pdf': book_pdf_info(b)})
+        if path.startswith('/img/'):
+            rel = path[len('/img/'):]
+            if '/' not in rel:
+                return self.send_json({'error': 'bad path'}, 400)
+            book, fname = rel.rsplit('/', 1)  # 书稿名可含 '/'（递归发现出的相对路径）
+            b = find_book(book)
+            if not b:
+                return self.send_json({'error': 'book not found'}, 404)
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in IMG_EXT:
+                return self.send_json({'error': 'bad extension'}, 400)
+            p = os.path.join(BOOKS_ROOT, b['name'], os.path.basename(fname))
+            if not os.path.isfile(p):
+                return self.send_json({'error': 'not found'}, 404)
+            return self.send_file(p)
+        if path.startswith('/api/sync'):
+            qs = self.query()
+            b = find_book(qs.get('book', ''))
+            if not b:
+                return self.send_json({'ok': False, 'error': 'book not found'}, 404)
+            try:
+                page = int(float(qs.get('page', '1')))
+                x, y = float(qs.get('x', '0')), float(qs.get('y', '0'))
+            except ValueError:
+                return self.send_json({'ok': False, 'error': '坐标参数不对'}, 400)
+            r = synctex_lookup(b, page, x, y)
+            if 'error' in r:
+                return self.send_json({'ok': False, 'error': r['error']})
+            return self.send_json({'ok': True, 'line': r['line'], 'page': r['page'],
+                                   'texName': r.get('file') or b['texName']})
+        if path.startswith('/api/pdf'):
+            qs = {}
+            if '?' in self.path:
+                for kv in self.path.split('?', 1)[1].split('&'):
+                    if '=' in kv:
+                        k, v = kv.split('=', 1)
+                        qs[k] = urllib.parse.unquote(v)
+            b = find_book(qs.get('book', ''))
+            if not b:
+                return self.send_json({'error': 'book not found'}, 404)
+            pdf_p = book_pdf_path(b['name'])
+            if not os.path.isfile(pdf_p):
+                return self.send_json({'error': '尚未编译'}, 404)
+            return self.send_file(pdf_p)
+        if path in ('/', '/index.html'):
+            # 多卡片架构（2026-10-18）：PDF 卡迁进 pdf/。根地址 302 过去——**必须相对跳转**，
+            # 反代下浏览器在 /backend/<label>/，相对 Location 才能落到 /backend/<label>/pdf/index.html。
+            return self.send_redirect('pdf/index.html')
+        # 静态资源：仅 app/ 目录内部（normpath 已折叠 ../..，前缀必须含分隔符防兄弟目录）
+        rel = path.lstrip('/')
+        if rel == 'tex' or rel.startswith('tex/'):
+            return self.send_json({'error': 'not found'}, 404)   # 自带编译链不对外托管
+        full = os.path.normpath(os.path.join(APP_DIR, rel))
+        if not (full == APP_DIR or full.startswith(APP_DIR + os.sep)) or not os.path.isfile(full):
+            return self.send_json({'error': 'not found'}, 404)
+        return self.send_file(full)
+
+    # ---------- POST ----------
+    def query(self):
+        qs = {}
+        if '?' in self.path:
+            for kv in self.path.split('?', 1)[1].split('&'):
+                if '=' in kv:
+                    k, v = kv.split('=', 1)
+                    qs[k] = urllib.parse.unquote(v)
+        return qs
+
+    def read_json(self):
+        try:
+            n = int(self.headers.get('Content-Length', '0'))
+            return json.loads(self.rfile.read(n).decode('utf-8'))
+        except (ValueError, OSError):
+            return None
+
+    def do_POST(self):
+        path = posixpath.normpath(urllib.parse.unquote(self.path.split('?', 1)[0]))
+        if path == '/api/newbook':
+            body = self.read_json()
+            if body is None:
+                return self.send_json({'error': 'bad request'}, 400)
+            return self.send_json(create_book(str(body.get('name', ''))))
+        if path == '/api/compile':
+            body = self.read_json()
+            if body is None:
+                return self.send_json({'error': 'bad request'}, 400)
+            b = find_book(str(body.get('book', '')))
+            if not b:
+                return self.send_json({'error': 'book not found'}, 404)
+            with COMPILE_LOCK:  # 串行化编译，页面端只需等待
+                return self.send_json(run_compile(b))
+        if path != '/api/write':
+            return self.send_json({'error': 'unknown endpoint'}, 404)
+        body = self.read_json()
+        if body is None:
+            return self.send_json({'error': 'bad request'}, 400)
+        b = find_book(str(body.get('book', '')))
+        if not b:
+            return self.send_json({'error': 'book not found'}, 404)
+        fname = os.path.basename(str(body.get('file', '')))
+        if not fname.lower().endswith('.tex'):
+            return self.send_json({'error': 'only .tex writable'}, 400)
+        p = os.path.join(BOOKS_ROOT, b['name'], fname)
+        if not os.path.isfile(p):
+            return self.send_json({'error': 'refusing to create new file'}, 403)
+        try:
+            with open(p, 'w', encoding='utf-8', newline='') as f:
+                f.write(str(body.get('content', '')))
+        except OSError as e:
+            return self.send_json({'error': str(e)}, 500)
+        return self.send_json({'ok': True, 'file': fname})
+
+
+def main():
+    global BOOKS_ROOT
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--port', type=int, default=8765)
+    ap.add_argument('--root', default=os.path.dirname(APP_DIR))
+    ap.add_argument('--no-open', action='store_true')
+    args = ap.parse_args()
+    BOOKS_ROOT = os.path.abspath(args.root)
+
+    srv = None
+    for port in range(args.port, args.port + 10):
+        try:
+            srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+            break
+        except OSError:
+            continue
+    if not srv:
+        print('端口 %d-%d 都被占用，无法启动。' % (args.port, args.port + 9))
+        sys.exit(1)
+
+    url = 'http://127.0.0.1:%d/' % srv.server_address[1]
+    print('Floria LaTeX 本地服务器已启动：' + url)
+    print('书稿根目录：' + BOOKS_ROOT)
+    print('（Ctrl+C 退出）')
+    if not args.no_open:
+        threading.Timer(0.6, webbrowser.open, [url]).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print('\n已退出。')
+
+
+if __name__ == '__main__':
+    main()

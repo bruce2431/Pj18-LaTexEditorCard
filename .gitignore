@@ -1,0 +1,5 @@
+# 自带编译链（MiKTeX Portable，GB 级）——随卡片携带但不进版本控制
+tex/
+
+# 运行时日志
+backend.log

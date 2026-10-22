@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Floria LaTeX</title>
+<link rel="stylesheet" href="css/app.css?v=0.5.0">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23111111'/><text x='50' y='68' font-size='52' text-anchor='middle' font-family='Georgia' fill='white'>F</text></svg>">
+</head>
+<body>
+
+<!-- ============ 唯一视图：纯 PDF（无目录页；打开哪篇由宿主广播 / 卡片命令驱动） ============ -->
+<div id="view-viewer">
+  <div id="pdf-scroll"><div id="pdf-pages"></div></div>
+
+  <!-- 空态：还没有任何书稿被打开时铺在视图区（PDF 页一渲出来就被 #pdf-pages 盖住，无需显隐） -->
+  <div id="view-empty">
+    <div class="ve-title">还没有打开论文</div>
+    <div class="ve-hint" id="ve-hint">从左侧文件树点开任意一篇 .tex，这里就会显示它的 PDF。</div>
+  </div>
+
+  <!-- 顶栏：**一条通栏白条**（照 Prism 的 PDF 预览列：白面 + 底边发丝线）——
+       左＝「文章目录」（PDF 书签抽屉入口），右＝「编译」/「界面调整」（2026-10-12 用户定案）。
+       「← 目录」（返回文件树）按钮已删（本页无目录可回，请宿主亮出文件树这件事由宿主侧承担）。
+       两枚次要按钮走**隐藏式边界（幽灵）**：无描边无底色，hover 才现形；只有「编译」是实心黑胶囊。
+       PDF 井（#pdf-scroll）从这条的下沿开始，页不从条底下穿过。 -->
+  <div class="v-top">
+    <button class="vt-icon" id="toc-toggle" title="文章目录（PDF 书签）">
+      <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+        <path d="M6 4h7.5M6 8h7.5M6 12h7.5M2.5 4h.01M2.5 8h.01M2.5 12h.01"/>
+      </svg>
+    </button>
+    <div class="vt-right">
+      <button class="vt-btn primary" id="v-compile" title="本机重新编译这篇论文">编译</button>
+      <div class="v-zoomwrap">
+        <button class="vt-btn ghost" id="pdf-zoom-toggle" title="界面大小调整"><span id="pdf-zoom-label">界面调整</span><span class="zcaret">▾</span></button>
+        <div id="zoom-panel" class="hidden">
+          <div class="zp-row">
+            <button data-zoom="fit">适宽</button>
+            <button data-zoom="fitpage">适页</button>
+          </div>
+          <div class="zp-row">
+            <button data-zoom="0.5">50%</button>
+            <button data-zoom="0.75">75%</button>
+            <button data-zoom="1">100%</button>
+            <button data-zoom="1.25">125%</button>
+            <button data-zoom="1.5">150%</button>
+            <button data-zoom="2">200%</button>
+          </div>
+          <div class="zp-slider">
+            <input type="range" id="pdf-zoom-range" min="40" max="300" step="5" value="100">
+            <span id="pdf-zoom-val">适宽</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 底浮条：翻页胶囊 -->
+  <div id="pdf-nav">
+    <div class="pv-caps">
+      <button id="pdf-prev" title="上一页">‹</button>
+      <span id="pdf-page-ind">– / –</span>
+      <button id="pdf-next" title="下一页">›</button>
+    </div>
+  </div>
+
+  <!-- 工具面板卡：卡头 = 工具 tab 条（注册表渲染）+ 收起；内容 = 各注册工具的 pane（全部常驻，按 applyToolTab 显隐） -->
+  <!-- 目录抽屉：读 PDF 自带书签（hyperref 的章节树），点条目跳页（Edge 那枚「目录」侧栏）。
+       入口 = 顶栏左侧那枚 #toc-toggle（2026-10-12 从 PDF 左上角浮按钮挪进顶栏）。 -->
+  <aside id="toc-drawer" class="hidden">
+    <div class="toc-head">
+      <span class="toc-title">目录</span>
+      <button class="icon-btn" id="toc-close" title="收起">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+          <path d="M4.2 4.2 11.8 11.8M11.8 4.2 4.2 11.8"/>
+        </svg>
+      </button>
+    </div>
+    <div class="toc-body" id="toc-body"></div>
+  </aside>
+
+  <aside id="side-card" class="hidden">
+    <div class="sc-head">
+      <div class="v-tooltabs in-card" id="tool-tabs"></div>
+      <span class="sc-title hidden" id="sc-title"></span>
+      <button class="icon-btn" id="sc-close" title="收起">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+          <path d="M4.2 4.2 11.8 11.8M11.8 4.2 4.2 11.8"/>
+        </svg>
+      </button>
+    </div>
+    <div class="sc-body">
+      <!-- 注册工具 pane（id 与 toolbar 注册项的 pane 字段一一对应） -->
+      <div class="tool-pane" id="tool-ver"></div>
+      <div class="tool-pane hidden" id="tool-log"></div>
+    </div>
+  </aside>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script src="lib/pdfjs/pdf.min.js"></script>
+<script src="js/pdfview.js?v=0.5.0"></script>
+<script src="js/util.js?v=0.5.0"></script>
+<script src="js/bridge.js?v=0.5.0"></script>
+<script src="js/toolbar.js?v=0.5.0"></script>
+<script src="js/viewer.js?v=0.5.0"></script>
+<script src="js/start.js?v=0.5.0"></script>
+</body>
+</html>

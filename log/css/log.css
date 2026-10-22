@@ -1,0 +1,124 @@
+/* ============================================================
+   编译日志卡（自包含；与 PDF 卡同一套纯黑白 token，但不引用它的文件）
+   ============================================================ */
+:root {
+  --bg: #FFFFFF;
+  --bg-soft: #F4F4F4;
+  --panel: #FFFFFF;
+  --border: #E2E2E2;
+  --border-soft: #EFEFEF;
+  --ink: #111111;
+  --ink-soft: #6B6B6B;
+  --ink-faint: #A0A0A0;
+  --accent-soft: #EDEDED;
+  --hover: #F2F2F4;
+  --desk: #EFEFEF;
+  --sans: "Segoe UI", "Microsoft YaHei UI", -apple-system, "PingFang SC", sans-serif;
+  --mono: Consolas, "JetBrains Mono", "Cascadia Mono", monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: var(--sans);
+  background: var(--desk);
+  color: var(--ink);
+  font-size: 14px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.hidden { display: none !important; }
+button { font-family: inherit; cursor: pointer; }
+
+/* 顶栏：与 PDF 卡同款通栏白条（白底 + 底边 1px 发丝线） */
+.lg-top {
+  flex: 0 0 48px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+  z-index: 2;
+}
+.lg-btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.lg-btn:hover { background: var(--accent-soft); }
+.lg-book {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+#lg-refresh { margin-left: auto; }
+
+/* 失败上下文横幅（由 floria-wk-card-init 的 payload.error 渲染） */
+.lg-banner {
+  flex: 0 0 auto;
+  padding: 9px 14px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12.5px;
+  color: var(--ink);
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+/* 列表 */
+.lg-list {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 2px 12px 24px;
+  background: var(--panel);
+}
+
+.pane-sec { display: flex; align-items: baseline; gap: 8px; padding: 14px 2px 6px; }
+.pane-sec-title { font-size: 11.5px; font-weight: 600; color: var(--ink-faint); letter-spacing: .4px; }
+.pane-sec-note { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+
+.lg-empty { padding: 56px 10px; text-align: center; }
+.le-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.le-hint { font-size: 12.5px; color: var(--ink-faint); line-height: 1.7; }
+
+/* 日志行：发丝分隔的列表行，不是一张张小卡 */
+.log-row {
+  padding: 10px 6px;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.log-row:hover { background: var(--hover); }
+.log-row.open { background: var(--hover); }
+.log-head { display: flex; align-items: baseline; gap: 8px; }
+.log-mark { font-size: 12px; font-weight: 700; flex: 0 0 auto; }
+.log-row.bad .log-mark { color: var(--ink); }
+.log-time { font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--ink-soft); flex: 0 0 auto; }
+.log-el { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+.log-brief { font-size: 12.5px; color: var(--ink-soft); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-by {
+  font-size: 10.5px; color: var(--ink-faint); border: 1px solid var(--border-soft);
+  border-radius: 4px; padding: 0 4px; flex: 0 0 auto; line-height: 1.6;
+}
+.log-body {
+  margin-top: 8px; padding: 8px; max-height: 360px; overflow: auto;
+  background: var(--bg-soft); border-radius: 8px;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-all;
+}
+.log-pages { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
