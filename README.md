@@ -49,7 +49,7 @@
 - **多卡片架构**：`.claude/preview/<cardId>/card.json` 描述标题与顺序，宿主顶栏渲染 tab；
   卡片通过 `floria-pv-*` / `floria-wk-card-*` postMessage 与宿主通信。
 - **宿主驱动打开**：宿主广播 `file-open{path}` → 卡片由目录段推出书稿名并切换，无目录页。
-- **zsh/Windows 便携**：随卡片携带 MiKTeX Portable + Perl，开箱即用、离线可编。
+- **Windows 便携**：随卡片携带 MiKTeX Portable + Perl，开箱即用、离线可编。
 
 ## 运行
 
@@ -71,7 +71,7 @@ Floria 网关模式：`preview.json` 声明 backend，网关懒拉起 `server.py
 ```
 pdf/            PDF 卡（查看器 / 工具栏 / 桥 / 编译五态 / 点 PDF 跳源码）
 log/            编译日志卡（自包含）
-lib/pdfjs/      pdf.js 3.11.174 legacy UMD（离线相对路径）
+pdf/lib/pdfjs/  pdf.js 3.11.174 legacy UMD（离线相对路径，卡片自包含）
 server.py       本地服务器：静态托管 + /api/books|read|write|compile|pdf|sync|newbook|history
 fastbuild.py    自动分章并行编译（缓存 / 拼接 / 书签与命名目标 / synctex 合并）
 preview.json    网关 backend 声明
