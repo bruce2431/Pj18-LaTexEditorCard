@@ -1,5 +1,16 @@
-# 自带编译链（MiKTeX Portable，GB 级）——随卡片携带但不进版本控制
-tex/
+# 自带编译链（MiKTeX Portable，GB 级）——随后端携带但不进版本控制
+_backend/tex/
 
-# 运行时日志
+# 自带 Python 运行时（embeddable，~25MB）——同样随后端携带、不进版本控制
+_backend/runtime/
+
+# 运行时日志 / 字节码
+_backend/backend.log
+_backend/__pycache__/
+
+# 网关托管后端自动写的运行日志（路径由宿主固定在预览根，不可配置）
 backend.log
+
+# Python 字节码
+__pycache__/
+*.pyc

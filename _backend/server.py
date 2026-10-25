@@ -7,9 +7,13 @@
 作用：像 Pj15 一样由本地进程直接读盘——页面经 http://127.0.0.1:<port> 打开后
 自动列出/加载书稿文件夹（含图片），零弹窗；Ctrl+S 保存经 /api/write 写回磁盘真实文件。
 
+目录结构（2026-10-25）：本文件在 `<预览根>/_backend/`，与 `tex/` 编译链同处；
+预览根下只有 `preview.json` 与各卡片目录（`pdf/`、`log/`，每张卡一个 `card.json`）。
+**静态托管只放行带 card.json 的卡片目录**，后端自身与 tex/ 不对外。
+
 安全边界：
 - 只绑定 127.0.0.1，不监听外网
-- 静态文件只出自 app/ 目录；书稿目录只出自 --root 下「递归扫到的含 .tex 目录」白名单
+- 静态文件只出自预览根下的卡片目录；书稿目录只出自 --root 下「递归扫到的含 .tex 目录」白名单
   （书稿名由发现结果反查，外部传入的名字不在白名单即 404，天然防目录穿越）
 - 文件名一律取 basename，拒绝 '..'；写回只允许覆盖已存在的 .tex
 """
@@ -29,7 +33,14 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DIR = os.path.dirname(os.path.abspath(__file__))      # <预览根>/_backend
+CARD_ROOT = os.path.dirname(APP_DIR)                     # <预览根>
+
+# 网关用 PATH 里的系统 `python` 拉起本服务，那个解释器不一定装了 pypdf；
+# 随后端携带一份纯 Python 的 pypdf（vendor/），保证按章并行的快速路径在任意解释器下都能用。
+_VENDOR = os.path.join(APP_DIR, 'vendor')
+if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
+    sys.path.insert(0, _VENDOR)
 IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp'}
 
 CONTENT_TYPES = {
@@ -49,16 +60,12 @@ COMPILE_LOCK = threading.Lock()  # 全局同时只跑一个编译（书稿大，
 SKIP_DIRS = {'node_modules', '__pycache__', 'venv', '.venv', 'site-packages'}
 
 
-def is_temp_dir(name):
-    """工作区临时任务目录命名 YYYYMMDDHHMMSS-名称（其中的 .tex 多为测试夹具，不算书稿）。"""
-    return len(name) > 15 and name[:14].isdigit() and name[14] == '-'
-
-
 def discover_books():
     """递归扫描根目录下「含 .tex 文件」的目录 → 书稿列表（每个目录=一篇文章）。
 
-    跳过：隐藏目录（.build/.git/…）、node_modules/__pycache__ 等构建垃圾、
-    工作区临时任务目录（YYYYMMDDHHMMSS-名称，其中的 .tex 多为测试夹具）；
+    跳过：隐藏目录（.build/.git/…）、node_modules/__pycache__ 等构建垃圾；
+    **不跳过临时任务目录**（YYYYMMDDHHMMSS-名称）——它们同样是合法书稿目录，
+    照常按下面同一套规则发现（2026-10-25 起兼容该命名）。
     根目录自身直接放的 .tex 不算书稿（工作区规则本就禁止根目录散文件）。
     书稿名 = 相对根目录的 POSIX 路径（可含 '/'，如 'papers/2026-xxx'），卡片直接显示。
     mtime = 该目录主 .tex 的修改时间（int 毫秒，与 book_pdf_info 一致；取不到退目录 mtime，再退 0）。
@@ -66,8 +73,7 @@ def discover_books():
     books = []
     root_abs = os.path.abspath(BOOKS_ROOT)
     for cur, dirs, files in os.walk(root_abs):
-        dirs[:] = [d for d in dirs
-                   if not d.startswith('.') and d not in SKIP_DIRS and not is_temp_dir(d)]
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in SKIP_DIRS]
         if os.path.abspath(cur) == root_abs:
             continue  # 根目录自身不算书稿
         texs = sorted(f for f in files if f.lower().endswith('.tex') and not f.startswith('.'))
@@ -196,6 +202,21 @@ def _scrape_log(logpath):
     return (ok, pages_in(txt))
 
 
+def _compiling(name):
+    """该书是否正在编译：本进程的编译锁，或 compile_book.py 落的 .build/.<job>.lock。
+
+    编译中途产物 mtime 会一路更新，若不挡，读日志卡就会把「正在进行的编译」误判成
+    「绕过账本的编译」，补出若干条 `by:'disk'`、耗时为 null 的假记录（2026-10-25 实测）。
+    """
+    if COMPILE_LOCK.locked():
+        return True
+    bdir = os.path.join(BOOKS_ROOT, name, '.build')
+    try:
+        return any(fn.startswith('.') and fn.endswith('.lock') for fn in os.listdir(bdir))
+    except OSError:
+        return False
+
+
 def _backfill(name, recs):
     """账本比磁盘编译痕迹旧 ⇒ 有绕过账本的编译（手工 latexmk / 其他脚本 / 失败编译）→ 补一条回溯。
 
@@ -204,7 +225,10 @@ def _backfill(name, recs):
     但 main.log/.fdb 会更新。痕迹比账本最新 ts 新 1s 以上就补一条（补完账本里已有同 ts 记录，
     下次读不再触发，自愈）。耗时无法回溯（null）；成败/页数从 .build/main.log 抓，抓不到给 null。
     一次只补最新一条（连续多次绕账编译只留最近一次的痕，可接受）。
+    **编译进行中直接跳过**：那时 mtime 只是中途产物，补出来的是假记录。
     """
+    if _compiling(name):
+        return recs
     traces = [book_pdf_path(name),
               os.path.join(BOOKS_ROOT, name, '.build', 'main.log'),
               os.path.join(BOOKS_ROOT, name, '.build', 'main.fdb_latexmk')]
@@ -691,8 +715,6 @@ def create_book(name):
         return {'ok': False, 'error': '名字不能以空格或点结尾'}
     if len(name) > 60:
         return {'ok': False, 'error': '名字太长（限 60 字内）'}
-    if is_temp_dir(name):
-        return {'ok': False, 'error': '这个名字形如工作区临时任务目录（时间戳-名称），会被书库扫描跳过，换个名字'}
     d = os.path.join(BOOKS_ROOT, name)
     if os.path.exists(d):
         return {'ok': False, 'error': '同名书稿目录已存在'}
@@ -706,7 +728,7 @@ def create_book(name):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'FloriaLaTeX/0.5.0'
+    server_version = 'FloriaLaTeX/0.5.4'
 
     def log_message(self, fmt, *args):
         if self.path.startswith('/api') or self.path.startswith('/img'):
@@ -822,12 +844,17 @@ class Handler(BaseHTTPRequestHandler):
             # 多卡片架构（2026-10-18）：PDF 卡迁进 pdf/。根地址 302 过去——**必须相对跳转**，
             # 反代下浏览器在 /backend/<label>/，相对 Location 才能落到 /backend/<label>/pdf/index.html。
             return self.send_redirect('pdf/index.html')
-        # 静态资源：仅 app/ 目录内部（normpath 已折叠 ../..，前缀必须含分隔符防兄弟目录）
+        # 静态资源：只放行**卡片目录**（第一段目录下必须有 card.json）。
+        # 后端自身（_backend/）、tex 编译链、隐藏目录都不对外；
+        # normpath 先折叠 ../..，再用「卡片目录 + 分隔符」做前缀校验防兄弟目录穿越。
         rel = path.lstrip('/')
-        if rel == 'tex' or rel.startswith('tex/'):
-            return self.send_json({'error': 'not found'}, 404)   # 自带编译链不对外托管
-        full = os.path.normpath(os.path.join(APP_DIR, rel))
-        if not (full == APP_DIR or full.startswith(APP_DIR + os.sep)) or not os.path.isfile(full):
+        seg = rel.split('/', 1)[0]
+        card_dir = os.path.join(CARD_ROOT, seg)
+        if not seg or seg.startswith(('.', '_')) or not os.path.isfile(
+                os.path.join(card_dir, 'card.json')):
+            return self.send_json({'error': 'not found'}, 404)
+        full = os.path.normpath(os.path.join(CARD_ROOT, rel))
+        if not full.startswith(card_dir + os.sep) or not os.path.isfile(full):
             return self.send_json({'error': 'not found'}, 404)
         return self.send_file(full)
 
@@ -890,7 +917,7 @@ def main():
     global BOOKS_ROOT
     ap = argparse.ArgumentParser()
     ap.add_argument('--port', type=int, default=8765)
-    ap.add_argument('--root', default=os.path.dirname(APP_DIR))
+    ap.add_argument('--root', default=os.path.dirname(os.path.dirname(CARD_ROOT)))  # 预览根上两级 = 项目根
     ap.add_argument('--no-open', action='store_true')
     args = ap.parse_args()
     BOOKS_ROOT = os.path.abspath(args.root)

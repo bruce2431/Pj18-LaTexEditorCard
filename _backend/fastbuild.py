@@ -146,6 +146,19 @@ def _cache_path(book_dir):
     return os.path.join(book_dir, '.build', CACHE_NAME)
 
 
+def _sync_ok(path):
+    """块 synctex 能否完整解压。**只看文件在不在不够**：进程被中断或磁盘写坏会留下
+    半截 gzip，页数/缓存都还自洽，直到合并 synctex 时才抛 zlib.error；旧逻辑把异常吞掉
+    并删掉 main.synctex.gz，于是编译报成功、点 PDF 却永远「还没有 synctex 数据」。"""
+    try:
+        with gzip.open(path, 'rb') as f:
+            while f.read(1 << 20):
+                pass
+        return True
+    except Exception:          # noqa: BLE001（zlib.error 不在 OSError 下）
+        return False
+
+
 def read_cache(book_dir):
     try:
         with open(_cache_path(book_dir), encoding='utf-8') as f:
@@ -536,7 +549,7 @@ def try_compile(book_dir, book_name, mk, perl, env, log_cb=None):
         changed = [i for i in range(n)
                    if hashes[i] != cached[i].get('built')
                    or not os.path.isfile(_chunk_pdf(book_dir, chunks[i]['id']))
-                   or not os.path.isfile(_chunk_sync(book_dir, chunks[i]['id']))]
+                   or not _sync_ok(_chunk_sync(book_dir, chunks[i]['id']))]
 
     # 非星号章才推进章号；\setcounter{chapter}{n} 让章内编号与整本一致
     chapter_no = []
@@ -599,6 +612,13 @@ def try_compile(book_dir, book_name, mk, perl, env, log_cb=None):
             # 什么都没改却与记录的版式不符（前置页/分页假设不成立）→ 回落整本
             return _skip('缓存里的起始页与 openright 布局对不上')
 
+    def compile_one(i, start_page):
+        try:
+            return _compile_chunk(book_dir, doc, i, start_page, chapter_no[i],
+                                  env, texcmd, xelatex_alt, xdvipdfmx_alt)
+        except Exception as ex:         # noqa: BLE001
+            return {'ok': False, 'out': str(ex), 'pdf': '', 'synctex': '', 'secs': 0}
+
     def compile_chunks(todo, starts_for):
         if not todo:
             return []
@@ -609,11 +629,7 @@ def try_compile(book_dir, book_name, mk, perl, env, log_cb=None):
             box = {}
 
             def work(ii=i, oo=starts_for[i], bx=box):
-                try:
-                    bx['r'] = _compile_chunk(book_dir, doc, ii, oo, chapter_no[ii],
-                                             env, texcmd, xelatex_alt, xdvipdfmx_alt)
-                except Exception as ex:     # noqa: BLE001
-                    bx['r'] = {'ok': False, 'out': str(ex), 'pdf': '', 'synctex': '', 'secs': 0}
+                bx['r'] = compile_one(ii, oo)
 
             th = threading.Thread(target=work)
             th.start()
@@ -626,12 +642,54 @@ def try_compile(book_dir, book_name, mk, perl, env, log_cb=None):
                 errs.append((chunks[i]['id'], r['out']))
         return errs
 
+    def compile_serially(todo, starts_for):
+        """一块一块地编（并发失败后的兜底重试）。"""
+        errs = []
+        for i in todo:
+            r = compile_one(i, starts_for[i])
+            if not r['ok'] or not os.path.isfile(r['pdf']):
+                errs.append((chunks[i]['id'], r['out']))
+        return errs
+
+    def rebuild_format():
+        """便携 MiKTeX 的格式文件损坏/过期时，单独重建一次（必须串行）。"""
+        mkm = os.path.join(texdir, 'miktex.exe') if texdir else ''
+        if not mkm or not os.path.isfile(mkm):
+            return False
+        try:
+            p = subprocess.run([mkm, '--disable-installer', 'formats', 'build',
+                                'xelatex', '--engine', 'xetex'],
+                               cwd=book_dir, timeout=180, capture_output=True, text=True,
+                               encoding='utf-8', errors='replace',
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                               env=env)
+            return p.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def format_race(errs):
+        """是否是「多个 xelatex 同时重建/抢占 xelatex.fmt」导致的启动级失败。"""
+        for _, out in errs:
+            s = out or ''
+            if 'did not succeed' in s or 'Permission denied' in s or 'xelatex.fmt' in s:
+                return True
+        return False
+
     t0 = time.time()
     errors = compile_chunks(changed, starts)
+    if errors and len(changed) > 1 and format_race(errors):
+        # 2026-10-25：便携 MiKTeX 在缓存/配置变动后，首个 xelatex 会重建 xelatex.fmt；
+        # 多个进程并发启动时只有一个能写、其余以 Permission denied 退出（被误判成块编译失败）。
+        # 串行重建格式，再把失败的块逐个重试一遍。
+        if log_cb:
+            log_cb('[并行编译] 检测到便携 MiKTeX 格式文件争用，串行重建后重试失败块')
+        rebuild_format()
+        failed = [i for i in changed if chunks[i]['id'] in {c for c, _ in errors}]
+        errors = compile_serially(failed, starts)
     if errors:
         if log_cb:
             for cid, out in errors:
-                log_cb('[并行编译失败] %s\n%s' % (cid, out[-1500:]))
+                log_cb('[并行编译失败] %s\n%s' % (cid, (out or '')[-1500:]))
         return _skip('块编译失败：%s' % '; '.join(c for c, _ in errors))
 
     pages = {}
@@ -718,6 +776,8 @@ def try_compile(book_dir, book_name, mk, perl, env, log_cb=None):
             os.remove(os.path.join(book_dir, 'main.synctex.gz'))
         except OSError:
             pass
+        # 不能带着「编译成功但没有同步数据」返回：回落整本 latexmk 重出 synctex。
+        return _skip('synctex 合并失败：%s' % ex)
 
     newcache = []
     for i in range(n):

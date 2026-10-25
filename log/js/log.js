@@ -77,7 +77,13 @@
     payload: null,       // floria-wk-card-init 带来的上下文 {book,path,error,ts}
     loaded: false,
   };
-  const BY_TAG = { page: '页', ai: 'AI', disk: '盘' };
+  const BY_TAG = { page: '页', chapter: '快速', ai: 'AI', disk: '回溯' };
+  const BY_TITLE = {
+    page: '在本页点「编译」产生的记录',
+    chapter: '在本页点「编译」走按章并行快速路径产生的记录',
+    ai: '会话里用 compile_book.py 编译产生的记录',
+    disk: '由磁盘产物回溯：这次编译没有经过应用的编译账本（手工 latexmk / 旧版本 / 其他脚本），只能拿到时间、成败与页数，耗时不详',
+  };
   let seq = 0;           // 并发装载的序号：后发起的覆盖先发起的（card-init 可能晚于首次装载）
 
   function bookFromPath(p) {
@@ -131,9 +137,9 @@
         <div class="log-head">
           <span class="log-mark">${e.ok ? '✓' : '✕'}</span>
           <span class="log-time">${esc(fmtStamp(e.ts))}</span>
-          <span class="log-el">${e.elapsed != null ? esc(e.elapsed + 's') : '—'}</span>
+          <span class="log-el"${e.elapsed == null ? ' title="这次编译的耗时没有记录（多为由磁盘回溯的旧编译）"' : ''}>${e.elapsed != null ? esc(e.elapsed + 's') : '耗时未知'}</span>
           ${e.pages != null ? '<span class="log-pages">' + esc(e.pages) + ' 页</span>' : ''}
-          ${BY_TAG[e.by] ? '<span class="log-by">' + BY_TAG[e.by] + '</span>' : ''}
+          ${BY_TAG[e.by] ? '<span class="log-by" title="' + esc(BY_TITLE[e.by] || '') + '">' + BY_TAG[e.by] + '</span>' : ''}
           <span class="log-brief">${esc(e.error || '编译通过')}</span>
         </div>
         <pre class="log-body hidden">${esc(e.log || '(无输出)')}</pre>
