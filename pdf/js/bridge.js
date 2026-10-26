@@ -45,6 +45,7 @@
   // 宿主 → 卡 的「通知」面（区别于命令：不配对、不回 ack，只是事实广播）。
   //   · floria-pv-event   —— 宿主对我（本卡）说的、无配对的消息
   //   · floria-pv-broadcast —— 宿主对**所有在场卡**说的广播（如「用户打开了某文件」）
+  //   · floria-wk-*       —— 多卡片/工具栏消息（card-init / tool-select / tool-ask…）
   // 谁需要谁登记（同 onCmd 的思路，本表不管内容）。门禁同上：只认 e.source === parent。
   const NOTES = new Map();     // type -> Set<fn>
   function onNote(type, fn) {
@@ -62,9 +63,9 @@
     if (!EMBEDDED || e.source !== window.parent) return;
     const d = e.data;
     if (!d || typeof d !== 'object') return;
-    // 宿主在目标卡 iframe load 后下发的一次性初始化上下文（多卡片切换带过来的 payload）
-    if (d.type === 'floria-wk-card-init') { dispatchNote(d.type, d); return; }
-    if (d.type === 'floria-pv-event' || d.type === 'floria-pv-broadcast') { dispatchNote(d.type, d); return; }
+    // 通知面：按 d.type 派给登记者（未登记的 no-op）。宿主/工具栏消息一律走这里收口，
+    // 卡内模块不再各自 addEventListener('message')。
+    dispatchNote(String(d.type || ''), d);
     if (d.type !== 'floria-pv-cmd') return;
     const cmd = String(d.cmd || '');
     const h = HANDLERS.get(cmd);

@@ -2,7 +2,8 @@
    契约逐条对齐 Floria 的 src/gateway/web-src/sidebar/work-tools.js（其 registerWkTool）：
    任何模块可调 registerTool({ id, title, pane, mount }) 挂一枚工具 tab —— 本表只做
    「注册 → 按序渲 tab → 交调用方切内容」，不写任何工具内容。
-     本页内置（viewer.js 注册）：'ver' 版本 → #tool-ver（纯占位）、'log' 日志 → #tool-log（真实编译记录）。
+     PDF 卡当前不注册任何工具：完整编译日志与历史只在独立的 log/ 卡。
+     注册表保留，供将来（或宿主）按需挂工具。
    契约：tab = <button class="v-tool-tab" data-tool="<id>">（点击委托挂在 viewer.js 的 #tool-tabs
    容器上，本表重渲不清事件）；active 态与 pane 互斥显隐由 viewer.js applyToolTab 唯一落。
    pane = 该工具内容所在元素 id；未注册工具的 pane 恒隐（applyToolTab 按 active id 判定）。 */
@@ -80,27 +81,22 @@
   let lastPosted = '';   // 去重：宿主每次收到申报都会回传选中 → 不去重就 register/select 互踢成死循环
   function postTools() {
     if (!EMBEDDED) return;
-    const payload = JSON.stringify(TOOL_DEFS.map(t => ({ id: t.id, title: t.title })));
+    const tools = TOOL_DEFS.map(t => ({ id: t.id, title: t.title }));
+    const payload = JSON.stringify(tools);
     if (payload === lastPosted) return;
     lastPosted = payload;
-    try {
-      parent.postMessage({ type: 'floria-wk-tool-register', tools: JSON.parse(payload) }, '*');
-    } catch (e) { /* 跨源/无父窗也不该炸 */ }
+    F.bridge.send({ type: 'floria-wk-tool-register', tools: tools });
   }
 
-  window.addEventListener('message', e => {
-    if (!EMBEDDED || e.source !== window.parent) return;
-    const d = e.data;
-    if (!d || typeof d !== 'object') return;
-    if (d.type === 'floria-wk-tool-select') {        // 宿主选了某枚工具（'' = 回默认态）→ 本页切 pane
-      setHosted(true);
-      window.dispatchEvent(new CustomEvent('floria:tool-select', { detail: { id: String(d.id || '') } }));
-    } else if (d.type === 'floria-wk-tool-host') {   // 宿主认领（旧 ack，保留兼容）
-      setHosted(true);
-    } else if (d.type === 'floria-wk-tool-ask') {    // 宿主索要工具表（挂载时机晚于本页时）
-      lastPosted = '';
-      postTools();
-    }
+  // 宿主/工具栏消息统一经 bridge 的通知面收口（不再自建 message 监听）。
+  F.bridge.onNote('floria-wk-tool-select', d => {  // 宿主选了某枚工具（'' = 回默认态）→ 本页切 pane
+    setHosted(true);
+    window.dispatchEvent(new CustomEvent('floria:tool-select', { detail: { id: String(d.id || '') } }));
+  });
+  F.bridge.onNote('floria-wk-tool-host', () => setHosted(true));   // 宿主认领（旧 ack，保留兼容）
+  F.bridge.onNote('floria-wk-tool-ask', () => {                    // 宿主索要工具表
+    lastPosted = '';
+    postTools();
   });
 
   F.toolbar = { registerTool, renderToolTabs, toolDef, toolDefs, toolNormId, mountTool,

@@ -1,6 +1,9 @@
 /* 编译日志卡（多卡片架构，2026-10-18）——自包含：
    不引用 PDF 卡的任何文件，自己实现 $ / esc / api（含反代门票 401 自愈）/ 渲染。
-   数据源 = server.py 落盘账本 GET /api/history?book=<书稿名>（结构 {ok, records:[{ts,ok,elapsed,pages,by,error,log}]}，新→旧）。
+   数据源 = PDF 卡后端的两条只读接口：
+     · GET /api/log?book=<书稿名>     —— .build/main.log 原文（当前这次编译的原始日志）；
+     · GET /api/history?book=<书稿名> —— 编译记录账本（新→旧，结构 {ok, records:[…]}）。
+   历史记录只在本卡实现；PDF 卡不再有日志/历史面板。
    进入方式：
      · 宿主顶栏点「编译日志」tab —— 无 payload，显示账本最近一次（展开）；
      · PDF 卡编译失败时发 floria-wk-card-switch{card:'log', payload:{book,path,error,ts}}，
@@ -86,6 +89,41 @@
   };
   let seq = 0;           // 并发装载的序号：后发起的覆盖先发起的（card-init 可能晚于首次装载）
 
+  // 编译模式：新账本直接给 mode；旧记录按 by 推断。
+  // full = 明确选择整本模式，reason_code/reason 说明「为什么不用快速路径」（不再是含混的「回落」）。
+  function modeOf(e) {
+    if (e.mode === 'fast') {
+      return e.ok
+        ? { text: '快速', title: BY_TITLE.chapter }
+        : { text: '快速失败', title: '按章并行快速路径失败，本次未执行整本重编' };
+    }
+    if (e.mode === 'full') {
+      const why = [e.reason_code, e.reason].filter(Boolean).join(' · ');
+      return { text: '整本', title: '整本 latexmk 编译' + (why ? '（原因：' + why + '）' : '') };
+    }
+    if (BY_TAG[e.by]) return { text: BY_TAG[e.by], title: BY_TITLE[e.by] || '' };
+    return null;
+  }
+  function phasesText(p) {
+    if (!p || typeof p !== 'object') return '';
+    return Object.keys(p).filter(k => p[k] != null)
+      .map(k => k + ' ' + p[k] + 's').join(' · ');
+  }
+  function detailHtml(e) {
+    const rows = [];
+    if (e.reason || e.reason_code) {
+      rows.push('整本模式原因：' + esc([e.reason_code, e.reason].filter(Boolean).join(' · ')));
+    }
+    const ph = phasesText(e.phases);
+    if (ph) rows.push('耗时分解：' + esc(ph));
+    if (e.chunks && e.chunks.total != null) {
+      rows.push('分块：共 ' + esc(e.chunks.total) + '，重编 ' + esc(e.chunks.rebuilt) +
+        '，复用 ' + esc(e.chunks.reused));
+    }
+    return rows.length ? '<div class="log-detail">' + rows.map(r => '<div>' + r + '</div>').join('') +
+      '</div>' : '';
+  }
+
   function bookFromPath(p) {
     p = String(p || '').replace(/\\/g, '/').replace(/^\/+/, '');
     return p.indexOf('/') < 0 ? '' : p.slice(0, p.lastIndexOf('/'));
@@ -106,6 +144,36 @@
       name = pick ? pick.name : '';
     }
     return name;
+  }
+
+  /* ---------------- 当前编译日志（.build/main.log） ---------------- */
+  function fmtSize(n) {
+    if (n == null) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+  function renderRaw(r, err) {
+    const el = $('lg-raw-text'), meta = $('lg-raw-meta');
+    if (err) {
+      meta.textContent = '读取失败';
+      el.textContent = err.message || String(err);
+      return;
+    }
+    if (!r || !r.exists) {
+      meta.textContent = '尚未生成';
+      el.textContent = '还没有 .build/main.log：先在 PDF 卡点一次「编译」。';
+      return;
+    }
+    meta.textContent = (r.mtime ? fmtStamp(r.mtime / 1000) + ' · ' : '') + fmtSize(r.size);
+    let text = String(r.text || '');
+    // 超大日志只渲染尾部：真正要看的是报错附近，整份塞进 DOM 会卡住滚动。
+    const LIMIT = 300000;
+    if (text.length > LIMIT) {
+      text = '…（仅显示最后 ' + fmtSize(LIMIT) + '，完整日志见 .build/main.log）\n' + text.slice(-LIMIT);
+    }
+    el.textContent = text || '(空日志)';
+    el.scrollTop = el.scrollHeight;
   }
 
   /* ---------------- 渲染 ---------------- */
@@ -139,10 +207,10 @@
           <span class="log-time">${esc(fmtStamp(e.ts))}</span>
           <span class="log-el"${e.elapsed == null ? ' title="这次编译的耗时没有记录（多为由磁盘回溯的旧编译）"' : ''}>${e.elapsed != null ? esc(e.elapsed + 's') : '耗时未知'}</span>
           ${e.pages != null ? '<span class="log-pages">' + esc(e.pages) + ' 页</span>' : ''}
-          ${BY_TAG[e.by] ? '<span class="log-by" title="' + esc(BY_TITLE[e.by] || '') + '">' + BY_TAG[e.by] + '</span>' : ''}
+          ${modeOf(e) ? '<span class="log-by" title="' + esc(modeOf(e).title) + '">' + modeOf(e).text + '</span>' : ''}
           <span class="log-brief">${esc(e.error || '编译通过')}</span>
         </div>
-        <pre class="log-body hidden">${esc(e.log || '(无输出)')}</pre>
+        <div class="log-body hidden">${detailHtml(e)}<pre>${esc(e.log || '(无输出)')}</pre></div>
       </div>`).join('');
     el.querySelectorAll('.log-row').forEach(row => {
       row.addEventListener('click', () => toggleRow(row));
@@ -187,19 +255,21 @@
     renderBanner();
     if (!name) {
       S.recs = [];
+      renderRaw(null);
       renderEmpty('没有可显示的书稿', '还没有编译记录：先在 PDF 卡里打开一篇论文并点「编译」。');
       return;
     }
-    let records = [];
-    try {
-      const r = await api('api/history?book=' + encodeURIComponent(name));
-      records = (r && r.records) || [];
-    } catch (e) {
-      if (my !== seq) return;
-      renderEmpty('读取编译记录失败', e.message || String(e));
+    const [hr, lr] = await Promise.all([
+      api('api/history?book=' + encodeURIComponent(name)).catch(e => ({ __err: e })),
+      api('api/log?book=' + encodeURIComponent(name)).catch(e => ({ __err: e })),
+    ]);
+    if (my !== seq) return;
+    renderRaw(lr.__err ? null : lr, lr.__err || null);
+    if (hr.__err) {
+      renderEmpty('读取编译记录失败', hr.__err.message || String(hr.__err));
       return;
     }
-    if (my !== seq) return;
+    const records = (hr && hr.records) || [];
     S.recs = records.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
     S.loaded = true;
     render();
@@ -216,6 +286,9 @@
     });
 
     $('lg-refresh').addEventListener('click', () => load(null));
+    $('lg-raw-toggle').addEventListener('click', () => {
+      $('lg-raw').classList.toggle('collapsed');
+    });
 
     load(null);   // 打开即拉历史（无 payload → 解析上次打开的书稿）
   }
