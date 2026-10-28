@@ -108,7 +108,7 @@ def _synctex_front(book):
     mapped = sum(1 for p in range(1, int(front) + 1) if data['pages'].get(p))
     status = 'ok' if mapped == int(front) else 'fail'
     return _check('synctex.front', status, '前置页 1..%d 有映射 %d 页' % (front, mapped),
-                  '点目录页可能无映射；再整本编译一次以重建基线')
+                  '点目录页可能无映射；再编译一次以重建前置页映射')
 
 
 def _fingerprint():
@@ -122,11 +122,9 @@ def _fingerprint():
 def run_checks(book=None, refresh=False):
     t0 = time.time()
     checks = [_import_check()]
-    for name in ('xelatex', 'latexmk', 'xdvipdfmx'):
+    for name in ('xelatex', 'xdvipdfmx'):
         c, _exe = _tool(name)
         checks.append(c)
-    c, _perl = _tool('perl', 'perl')
-    checks.append(c)
     checks.append(_miktex_db())
     checks.append(_miktex_fmt())
     checks.append(_cache_check(book))

@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-"""真实 TeX 的模式选择集成回归（临时书稿，不碰用户书稿）。
+"""真实 TeX 的集成回归（临时书稿，不碰用户书稿）。
 
-覆盖：
-  - 单章 / 双章 / \\appendix / \\part 书稿的模式选择与原因码
-  - 双章首次整本（no_main_pdf）→ 第二次快速
+2026-10-27 起**只有快速路径**（整本 latexmk 全量兜底已删除）：
+  - 单章 / 无章 / \\part 书稿都按块编译（不再「因为结构不适用而整本」）
+  - 冷启动没有 main.pdf 也能直接分块编译
+  - 新增一章：新块编译 + 页码/目录重排，书签按目录条目重建
+  - 改前置页正文：前置页单独重编，main.pdf 里的新文字可见
   - synctex 合并失败：快速路径直接失败，且 main.pdf 不被替换
-  - AI/main.tex 历史上的 `Missing $ inserted` 回归（源文件现在可编译）
+  - \\appendix：明确报错（不能按章拼接）
+  - AI/main.tex 历史上的 `Missing $ inserted` 回归
 
 运行：cd pdf/backend && runtime/python.exe -B tests/integration_modes.py
 只写 <工作区>/.claude/temp/ 下的临时目录。
@@ -35,6 +38,30 @@ TEX_SINGLE = r"""\documentclass[UTF8]{ctexbook}
 \begin{document}
 \chapter{唯一}
 正文
+\end{document}
+"""
+
+TEX_ZERO = r"""\documentclass[UTF8]{ctexbook}
+\begin{document}
+\section{引言}
+没有章的小稿。
+\end{document}
+"""
+
+TEX_ZERO = r"""\documentclass[UTF8]{ctexbook}
+\begin{document}
+\section{引言}
+没有章的小稿。
+\end{document}
+"""
+
+# ctexart：没有 \chapter / \part 计数器（MARXISM 就是这类书稿）
+TEX_ARTICLE = r"""\documentclass[UTF8]{ctexart}
+\begin{document}
+\section{一}
+第一节正文。
+\section{二}
+第二节正文。
 \end{document}
 """
 
@@ -70,7 +97,6 @@ TEX_PART = r"""\documentclass[UTF8]{ctexbook}
 \end{document}
 """
 
-
 TEX_FRONT = r"""\documentclass[UTF8]{ctexbook}
 \usepackage{hyperref}
 \begin{document}
@@ -101,6 +127,13 @@ def _write_book(root, name, text):
     return d
 
 
+def _edit(path, old, new):
+    with open(path, encoding='utf-8') as f:
+        text = f.read()
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text.replace(old, new))
+
+
 def _temp_root():
     ws = os.path.dirname(PROJECT)
     cand = os.path.join(ws, '.claude', 'temp')
@@ -111,6 +144,32 @@ def _temp_root():
     return tempfile.mkdtemp(prefix='pj18-integration-', dir=cand)
 
 
+def _toc_pages(pdf_p):
+    """书签树 → [(标题, 页码, 子书签)]（页码 1 基，pypdf 的 outline 是嵌套 list）。"""
+    from pypdf import PdfReader
+    r = PdfReader(pdf_p)
+
+    def walk(nodes):
+        out, i = [], 0
+        while i < len(nodes):
+            it = nodes[i]
+            if isinstance(it, list):
+                i += 1
+                continue
+            kids = []
+            if i + 1 < len(nodes) and isinstance(nodes[i + 1], list):
+                kids = walk(nodes[i + 1])
+                i += 1
+            try:
+                out.append((str(it.title), r.get_destination_page_number(it) + 1, kids))
+            except Exception:                   # noqa: BLE001
+                pass
+            i += 1
+        return out
+
+    return walk(r.outline)
+
+
 class IntegrationModesTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -118,13 +177,9 @@ class IntegrationModesTest(unittest.TestCase):
         cls.books_root = os.path.join(cls._tmp, 'books')
         os.makedirs(cls.books_root)
 
-        perl = toolchain.find_perl()
         env = toolchain.sanitized_env()
-        # 只前置 perl（latexmk 需要）。**不要把 MiKTeX bin 加进 PATH**：
-        # 2026-10-26 实测，PATH 里带上自带 MiKTeX bin 后 XeTeX 的字体查找会失败
-        # （SimSun cannot be found / 返回码 12），而 latexmk 本身用绝对路径调用、无需在 PATH。
-        if perl:
-            env['PATH'] = os.path.dirname(perl) + os.pathsep + env.get('PATH', '')
+        # **不要把 MiKTeX bin 加进 PATH**：2026-10-26 实测 PATH 里带上自带 MiKTeX bin
+        # 后 XeTeX 的字体查找会失败（SimSun cannot be found / 返回码 12）。
         cls._env_patch = mock.patch.object(
             toolchain, 'sanitized_env', side_effect=lambda: dict(env))
         cls._env_patch.start()
@@ -150,50 +205,76 @@ class IntegrationModesTest(unittest.TestCase):
                  time.time() - t0))
         return r
 
-    def test_01_single_chapter_full(self):
-        _write_book(self.books_root, 'single', TEX_SINGLE)
+    def test_01_single_chapter_is_fast(self):
+        d = _write_book(self.books_root, 'single', TEX_SINGLE)
         r = self._compile('single')
         self.assertTrue(r['ok'], r.get('error') or r.get('log'))
-        self.assertEqual(r['mode'], 'full')
-        self.assertEqual(r['reason_code'], 'single_chapter')
+        self.assertEqual(r['mode'], 'fast')
+        self.assertIsNone(r['reason_code'])
+        self.assertTrue(os.path.isfile(os.path.join(d, 'main.pdf')))
+        self.assertEqual((r.get('chunks') or {}).get('total'), 1)
 
-    def test_02_appendix_full(self):
+    def test_02_zero_chapter_is_fast(self):
+        _write_book(self.books_root, 'zero', TEX_ZERO)
+        r = self._compile('zero')
+        self.assertTrue(r['ok'], r.get('error') or r.get('log'))
+        self.assertEqual(r['mode'], 'fast')
+        self.assertEqual((r.get('chunks') or {}).get('total'), 1)
+
+    def test_03_appendix_reports_error(self):
         _write_book(self.books_root, 'appendix', TEX_APPENDIX)
         r = self._compile('appendix')
-        self.assertTrue(r['ok'], r.get('error') or r.get('log'))
-        self.assertEqual(r['mode'], 'full')
+        self.assertFalse(r['ok'])
+        self.assertEqual(r['mode'], 'fast')
         self.assertEqual(r['reason_code'], 'has_appendix')
 
-    def test_03_part_full(self):
-        _write_book(self.books_root, 'part', TEX_PART)
+    def test_04_part_is_fast(self):
+        d = _write_book(self.books_root, 'part', TEX_PART)
         r = self._compile('part')
         self.assertTrue(r['ok'], r.get('error') or r.get('log'))
-        self.assertEqual(r['mode'], 'full')
-        self.assertEqual(r['reason_code'], 'has_part')
+        self.assertEqual(r['mode'], 'fast')
+        self.assertEqual((r.get('chunks') or {}).get('total'), 3)
+        pages = _toc_pages(os.path.join(d, 'main.pdf'))
+        # \part 是顶层书签，chapter 嵌在它下面
+        self.assertEqual(len(pages), 1)
+        self.assertIn('上卷', pages[0][0])
+        self.assertEqual(len(pages[0][2]), 2, '两章应嵌在分卷书签下')
 
-    def test_04_two_chapters_full_then_fast(self):
-        _write_book(self.books_root, 'dual', TEX_DUAL)
+    def test_05_dual_cold_start_then_add_chapter(self):
+        d = _write_book(self.books_root, 'dual', TEX_DUAL)
         first = self._compile('dual')
         self.assertTrue(first['ok'], first.get('error') or first.get('log'))
-        self.assertEqual(first['mode'], 'full')
-        self.assertEqual(first['reason_code'], 'no_main_pdf')
+        self.assertEqual(first['mode'], 'fast', '冷启动不再需要整本先编一次')
+        self.assertEqual((first.get('chunks') or {}).get('total'), 2)
 
+        # TOC 页码与实际页对得上（书签由分块 toc 合成）
+        pages = _toc_pages(os.path.join(d, 'main.pdf'))
+        self.assertEqual(len(pages), 2)
+        self.assertIn('甲', pages[0][0])
+        self.assertIn('乙', pages[1][0])
+        cache = fastpath.read_cache(d) or {}
+        starts = {c['id']: c['start'] for c in cache.get('chunks') or []}
+        self.assertEqual(pages[0][1], starts['ch1'])
+        self.assertEqual(pages[1][1], starts['ch2'])
+
+        # 新增第三章：只有新块需要新编，书签随之变成三项
+        _edit(os.path.join(d, 'main.tex'), '乙文', '乙文\n\\chapter{丙}\n丙文')
         second = self._compile('dual')
         self.assertTrue(second['ok'], second.get('error') or second.get('log'))
         self.assertEqual(second['mode'], 'fast')
-        self.assertIsNone(second['reason_code'])
+        self.assertEqual((second.get('chunks') or {}).get('total'), 3)
+        titles = [t for t, _, _ in _toc_pages(os.path.join(d, 'main.pdf'))]
+        self.assertEqual(len(titles), 3)
+        self.assertIn('丙', titles[2])
+        self.assertEqual((second.get('chunks') or {}).get('rebuilt'), 1,
+                         '新增一章应只编新块（后面的块页码未变就不用重编）')
 
-    def test_05_synctex_failure_keeps_pdf(self):
+    def test_06_synctex_failure_keeps_pdf(self):
         dual = os.path.join(self.books_root, 'dual')
         pdf_p = os.path.join(dual, 'main.pdf')
         before = _digest(pdf_p)
 
-        tex_p = os.path.join(dual, 'main.tex')
-        with open(tex_p, encoding='utf-8') as f:
-            text = f.read()
-        with open(tex_p, 'w', encoding='utf-8') as f:
-            f.write(text.replace('甲文', '甲文（改）'))
-
+        _edit(os.path.join(dual, 'main.tex'), '甲文', '甲文（改）')
         with mock.patch.object(fastpath, '_merge_synctex',
                                side_effect=RuntimeError('boom-sync')):
             r = self._compile('dual')
@@ -204,26 +285,16 @@ class IntegrationModesTest(unittest.TestCase):
                          'synctex 合并失败时 main.pdf 不应被替换')
 
     def test_07_front_edit_rebuilds_front_pages(self):
-        """回归 2026-10-26：改前置页正文后，快速路径不能沿用旧 main.pdf 的封面/目录。"""
+        """改前置页正文：前置页单独重编，成品里必须是新文字（不再是旧的封面/目录）。"""
         d = _write_book(self.books_root, 'front', TEX_FRONT)
         first = self._compile('front')
         self.assertTrue(first['ok'], first.get('error') or first.get('log'))
-        self.assertEqual(first['mode'], 'full')
+        self.assertEqual(first['mode'], 'fast')
 
+        _edit(os.path.join(d, 'main.tex'), 'FRONTEDIT-A', 'FRONTEDIT-B')
         second = self._compile('front')
         self.assertTrue(second['ok'], second.get('error') or second.get('log'))
         self.assertEqual(second['mode'], 'fast')
-
-        tex_p = os.path.join(d, 'main.tex')
-        with open(tex_p, encoding='utf-8') as f:
-            text = f.read()
-        with open(tex_p, 'w', encoding='utf-8') as f:
-            f.write(text.replace('FRONTEDIT-A', 'FRONTEDIT-B'))
-
-        third = self._compile('front')
-        self.assertTrue(third['ok'], third.get('error') or third.get('log'))
-        self.assertEqual(third['mode'], 'full', '前置页源码改过必须整本重编')
-        self.assertEqual(third['reason_code'], 'front_baseline_missing')
 
         from pypdf import PdfReader
         r = PdfReader(os.path.join(d, 'main.pdf'))
@@ -232,11 +303,32 @@ class IntegrationModesTest(unittest.TestCase):
         self.assertIn('FRONTEDIT-B', front_txt)
         self.assertNotIn('FRONTEDIT-A', front_txt)
 
-        fourth = self._compile('front')
-        self.assertTrue(fourth['ok'], fourth.get('error') or fourth.get('log'))
-        self.assertEqual(fourth['mode'], 'fast')
+        third = self._compile('front')
+        self.assertTrue(third.get('noop'), '源码没变应直接复用成品（0 秒）')
 
-    def test_06_ai_regression(self):
+    def test_08_single_edit_reuses_other_chunks(self):
+        """改一章只重编那一块；缓存里每块都有 pages/built。"""
+        d = _write_book(self.books_root, 'reuse', TEX_DUAL)
+        first = self._compile('reuse')
+        self.assertTrue(first['ok'], first.get('error') or first.get('log'))
+
+        cache = fastpath.read_cache(d) or {}
+        self.assertIsNotNone(cache.get('front'))
+        self.assertTrue(all(isinstance(c.get('pages'), int) and c.get('built')
+                            for c in cache.get('chunks') or []),
+                        '缓存应含每块的 pages/built：%r' % (cache,))
+
+        _edit(os.path.join(d, 'main.tex'), '乙文', '乙文（改）')
+        r = self._compile('reuse')
+        self.assertTrue(r['ok'], r.get('error') or r.get('log'))
+        chunks = r.get('chunks') or {}
+        self.assertEqual(chunks.get('rebuilt'), 1, '只应重编被改的那一块：%r' % (chunks,))
+        self.assertEqual(chunks.get('reused'), 1)
+
+        again = self._compile('reuse')
+        self.assertTrue(again.get('noop'), '源码没变应直接复用成品（0 秒）')
+
+    def test_09_ai_regression(self):
         src = os.path.join(PROJECT, 'AI', 'main.tex')
         if not os.path.isfile(src):
             self.skipTest('AI/main.tex 不存在')
@@ -254,6 +346,15 @@ class IntegrationModesTest(unittest.TestCase):
         log = r.get('log') or ''
         self.assertNotIn('Missing $ inserted', log)
         self.assertNotIn(':error:', log)
+
+    def test_10_article_class_has_no_chapter_counter(self):
+        # ctexart 没有 \chapter 计数器：wrapper 无条件 \setcounter{chapter} 会在
+        # -halt-on-error 下直接失败（"No counter 'chapter' defined"），MARXISM 实测。
+        _write_book(self.books_root, 'article', TEX_ARTICLE)
+        r = self._compile('article')
+        self.assertTrue(r['ok'], r.get('error') or r.get('log'))
+        self.assertEqual(r['mode'], 'fast')
+        self.assertNotIn("No counter 'chapter' defined", r.get('log') or '')
 
 
 if __name__ == '__main__':

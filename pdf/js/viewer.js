@@ -60,6 +60,7 @@
      桥接（iframe）时不抢跑，等宿主的 open 命令 / floria-pv-file-open 广播。 */
   async function preload() {
     if (F.bridge.embedded()) return;
+    if (S.book) return;                 // hash 路由已选定书稿：别再挑一篇把它顶掉
     try {
       const books = await F.api('api/books');
       const b = (books || []).find(x => x.pdf && x.pdf.exists) || (books || [])[0];

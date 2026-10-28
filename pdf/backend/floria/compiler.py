@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-"""编译服务：锁 → 快速路径 → 整本回落 → 账本 → synctex 基线。
+"""编译服务：锁 → 无改动直通 → 按章并行快速路径 → 账本。
 
+**只有一条编译路径**：`fastpath.try_compile`。整本 latexmk 兜底已删除（2026-10-27），
+结构不适用（`\\appendix`）或真实故障都直接报错并把原因码写进账本。
 对外只有 `CompilerService.compile(book_name, origin)` 与 `snapshot()`。
 返回字段兼容旧版（ok/time/mtime/pages/log/error），并补充
-`fast/mode/reason/phases/chunks/by`，供前端与日志卡显示。
+`fast/mode/reason/reason_code/phases/chunks/by`，供前端与日志卡显示。
 """
 import os
+import shutil
 import time
 
 from . import books, config, fastpath, ledger, locks, log, toolchain
@@ -37,9 +40,9 @@ class CompilerService:
             log.exception('compiler.compile', ex)
             msg = '编译服务异常：%s: %s' % (type(ex).__name__, ex)
             _ledger(b['name'], ok=False, elapsed=None, by=origin, reason=msg,
-                    reason_code='compiler_exception', error=msg, log='', mode='none')
+                    reason_code='compiler_exception', error=msg, log='', mode='fast')
             return {'ok': False, 'error': msg, 'log': '', 'time': 0,
-                    'fast': False, 'mode': 'none', 'reason': msg,
+                    'fast': False, 'mode': 'fast', 'reason': msg,
                     'reason_code': 'compiler_exception'}
         finally:
             self.state.end(tok)
@@ -49,42 +52,57 @@ class CompilerService:
         book_dir = books.book_dir(b['name'])
         build_dir = os.path.join(book_dir, '.build')
         os.makedirs(build_dir, exist_ok=True)
-        mk = toolchain.find_tex_tool('latexmk')
         tex = toolchain.find_tex_tool('xelatex')
-        perl = toolchain.find_perl()
-        use_mk = bool(mk and perl)
-        if not use_mk and not tex:
-            msg = '未找到可用的 TeX 引擎（项目自带 tex/ 与系统 PATH 均无 xelatex）'
+        if not tex and not shutil.which('xelatex'):
+            msg = '未找到可用的 xelatex（项目自带 tex/ 与系统 PATH 均无）'
             return {'ok': False, 'error': msg, 'log': '', 'time': 0,
-                    'fast': False, 'mode': 'none', 'reason': msg,
+                    'fast': False, 'mode': 'fast', 'reason': msg,
                     'reason_code': 'no_toolchain'}
         env = toolchain.sanitized_env()
         t_lock_end = time.time()
 
-        # ---- 快速路径 ----
+        # ---- 无改动直通 ----
+        # 源码指纹与成品都和上次成功编译一致 ⇒ 没必要再编（iPad 反复点编译、
+        # 打开时自动校验等场景 0 秒返回）。图片变化也计入指纹。
+        src_fp = fastpath.source_fingerprint(book_dir)
+        reuse_pages = fastpath.unchanged_output(book_dir, src_fp)
+        if reuse_pages is not None:
+            pdf_p = books.book_pdf_path(b['name'])
+            pages = reuse_pages or toolchain._pdf_pages(pdf_p)
+            msg = '源码未变化，复用现有成品'
+            _write_main_log(book_dir, '[编译链] ' + msg)
+            _ledger(b['name'], ok=True, elapsed=0.0, pages=pages, by=origin,
+                    mode='fast', reason=None, reason_code=None, phases={},
+                    chunks=None, log='[编译链] ' + msg)
+            return {'ok': True, 'time': 0.0,
+                    'mtime': int(os.path.getmtime(pdf_p) * 1000), 'pages': pages,
+                    'log': '[编译链] ' + msg, 'fast': True, 'noop': True,
+                    'mode': 'fast', 'reason': None, 'reason_code': None,
+                    'phases': {}, 'chunks': None, 'by': origin}
+
+        # ---- 快速路径（唯一编译路径）----
         self.state.set_phase('fast', token=tok)
         t0 = time.time()
         fr = None
-        status = fastpath.STATUS_FAILED
         reason_code = 'fastpath_exception'
         skip = ''
         try:
-            fr = fastpath.try_compile(book_dir, b['name'], mk, perl, env)
+            fr = fastpath.try_compile(book_dir, b['name'], tex, env)
             if isinstance(fr, dict):
-                status = fr.get('status') or ('ok' if fr.get('ok') else fastpath.STATUS_FAILED)
                 reason_code = fr.get('reason_code')
                 skip = fr.get('reason') or ''
-            else:                           # 旧 shim 返回值兼容
-                status = fastpath.STATUS_OK if fr else fastpath.STATUS_FAILED
+            else:
                 reason_code = None if fr else 'fastpath_failed'
                 skip = '' if fr else (fastpath.LAST_SKIP or '快速路径未给出原因')
         except Exception as ex:                 # noqa: BLE001
             log.exception('fastpath.try_compile', ex)
-            status = fastpath.STATUS_FAILED
             reason_code = 'fastpath_exception'
             skip = '快速路径异常：%s' % ex
+            fr = None
         t_fast = time.time()
-        if status == fastpath.STATUS_OK and fr:
+        elapsed = round(t_fast - t0, 2)
+
+        if fr and fr.get('status', fastpath.STATUS_OK) == fastpath.STATUS_OK:
             phases = dict(fastpath.LAST_PHASES)
             phases.update({'lock': round(t_lock_end - t_lock, 2),
                            'plan': round(t_fast - t0 - sum(phases.values()), 2),
@@ -96,189 +114,27 @@ class CompilerService:
             fr.update({'fast': True, 'mode': 'fast', 'reason': None, 'reason_code': None,
                        'phases': phases, 'chunks': fastpath.LAST_CHUNKS or None,
                        'by': 'chapter'})
+            fastpath.write_last_ok(book_dir, src=src_fp, pages=fr.get('pages'))
             return fr
 
-        if status == fastpath.STATUS_FAILED:
-            # 快速路径真实失败：直接报错，不再隐式整本重编。
-            elapsed = round(t_fast - t0, 2)
-            out_log = (fr or {}).get('log') or skip
-            msg = '快速编译失败[%s]：%s' % (reason_code or 'unknown', skip or '未给出原因')
-            phases = {'lock': round(t_lock_end - t_lock, 2),
-                      'plan': elapsed, 'total': round(t_fast - t_lock, 2)}
-            log.warn(msg)
-            _write_main_log(book_dir, out_log)
-            _ledger(b['name'], ok=False, elapsed=elapsed, by=origin, mode='fast',
-                    reason=skip, reason_code=reason_code, phases=phases,
-                    error=msg, log=out_log)
-            return {'ok': False, 'time': elapsed, 'log': out_log, 'error': msg,
-                    'fast': True, 'mode': 'fast', 'reason': skip,
-                    'reason_code': reason_code, 'phases': phases, 'chunks': None,
-                    'by': origin}
-
-        # unsupported：结构/环境不适用，明确选择整本模式（不是「回落」）
-        log.info('整本模式（原因：%s %s）' % (reason_code or 'unsupported', skip))
-
-        # ---- 整本回落 ----
-        self.state.set_phase('full', token=tok)
-        chain = ('[编译链] latexmk -xelatex 增量（perl: %s）' % perl) if use_mk else \
-                '[编译链] xelatex 直驱两遍（未找到 perl，已跳过 latexmk；较慢）'
-        if skip or reason_code:
-            chain += '\n[编译链] 整本模式（原因：%s %s）' % (reason_code or 'unsupported', skip)
-        syn_p = books.book_synctex_path(b['name'])
-        front = _front_guess(book_dir)
-        fh = fastpath.front_hash_of(book_dir)
-        # 现有 main.synctex.gz 若含前置页就就地采纳为基线，不必为了基线整本重编；
-        # 前置页正文改过（hash 不符）则旧基线作废，必须整本重编
-        bl_ok = (os.path.isfile(syn_p)
-                 and fastpath.ensure_front_baseline(book_dir, front, fh)[0])
-        need_front = bool(front) and not bl_ok
-        tex_p = os.path.join(book_dir, b['texName'])
-        pdf_p = books.book_pdf_path(b['name'])
-        # 源比 PDF 新 ⇒ latexmk 必然跑一遍 xelatex，synctex 会整份重写，不必 -g；
-        # 只有「无事可做」的增量才直接 -g（否则留下的仍是旧的不完整 synctex）
-        fresh = (os.path.isfile(pdf_p) and os.path.isfile(tex_p)
-                 and os.path.getmtime(tex_p) > os.path.getmtime(pdf_p))
-        if need_front and not fresh and tex:
-            # PDF 已是最新，只缺一份含前置页的 synctex：单遍 xelatex 就能整份重写，
-            # 比 latexmk -g 全量重编便宜得多（-g 常多花几十秒）。
-            # 必须 -no-pdf：XDV 模式与各章分块/ latexmk 的 synctex 头部偏移一致
-            # （PDF 模式会写成 X/Y Offset 0，合并时被判参数不一致）。
-            self.state.set_phase('synctex', token=tok)
-            t_rep = time.time()
-            try:
-                rc_r, out_r = toolchain.run_tool(
-                    [tex, '-no-pdf', '-synctex=1', '-interaction=nonstopmode',
-                     '-halt-on-error', '-file-line-error', '-output-directory=.build',
-                     b['texName']],
-                    cwd=book_dir, timeout=config.COMPILE_TIMEOUT, env=env)
-                if rc_r == 0:
-                    toolchain.hoist_outputs(book_dir)
-                    if _syn_front_ok(syn_p, front):
-                        log.info('已用单遍 xelatex 补齐前置页 synctex（%.1fs），免去 -g 整本重编'
-                                 % (time.time() - t_rep))
-                        need_front = False
-                else:
-                    log.warn('单遍 xelatex 补 synctex 失败（返回码 %s），改走 -g' % rc_r)
-            except Exception as ex:             # noqa: BLE001
-                log.exception('synctex 修复', ex)
-            self.state.set_phase('full', token=tok)
-        cmd_force = None
-        if use_mk:
-            base = [mk, '-xelatex', '-synctex=1']
-            tail = ['-interaction=nonstopmode', '-halt-on-error', '-file-line-error',
-                    '-auxdir=.build', b['texName']]
-            cmd = base + (['-g'] if (need_front and not fresh) else []) + tail
-            cmd_force = base + ['-g'] + tail
-            env['PATH'] = os.path.dirname(perl) + os.pathsep + env.get('PATH', '')
-        else:
-            cmd = [tex, '-synctex=1', '-interaction=nonstopmode', '-halt-on-error',
-                   '-file-line-error', '-output-directory=.build', b['texName']]
-        tf0 = time.time()
-        try:
-            rc, out = toolchain.run_tool(cmd, cwd=book_dir,
-                                         timeout=config.COMPILE_TIMEOUT, env=env)
-            if rc is None and out == 'timeout':
-                raise TimeoutError('timeout')
-            second = None
-            if not use_mk and rc == 0:
-                second = toolchain.run_tool(cmd, cwd=book_dir,
-                                            timeout=config.COMPILE_TIMEOUT, env=env)
-                if second[0] is None and second[1] == 'timeout':
-                    raise TimeoutError('timeout')
-            # 增量其实没跑 xelatex（Nothing to do）→ synctex 还是旧的不完整版本，
-            # 强制 -g 再走一遍，确保这次编译真正产出前置页映射
-            if use_mk and rc == 0 and need_front and not _syn_front_ok(syn_p, front):
-                log.warn('整本增量未重写 synctex（前置页仍缺映射），强制 -g 重编一次')
-                rc, out = toolchain.run_tool(cmd_force, cwd=book_dir,
-                                             timeout=config.COMPILE_TIMEOUT, env=env)
-                if rc is None and out == 'timeout':
-                    raise TimeoutError('timeout')
-            elapsed = round(time.time() - tf0, 1)
-            toolchain.hoist_outputs(book_dir)
-            pdf_p = books.book_pdf_path(b['name'])
-            final_rc = second[0] if second else rc
-            if final_rc == 0 and os.path.isfile(pdf_p):
-                stdout = (second[1] if second else out) or ''
-                full_log = stdout + '\n' + chain
-                pages = ledger.pages_in(full_log)
-                if pages is None:
-                    _ok, pages = ledger.scrape_log(os.path.join(build_dir, 'main.log'))
-                if pages is None:
-                    pages = toolchain._pdf_pages(pdf_p)
-                # 整本编译成功 → 刷新按章缓存 + 留存前置页 synctex 基线
-                try:
-                    fastpath.refresh_cache(book_dir)
-                    fastpath.save_front_baseline(book_dir, front_hash=fh)
-                except Exception as ex:         # noqa: BLE001
-                    log.exception('refresh_cache/save_front_baseline', ex)
-                phases = {'lock': round(t_lock_end - t_lock, 2),
-                          'plan': round(t_fast - t0, 2),
-                          'full': elapsed, 'total': round(time.time() - t_lock, 2)}
-                _ledger(b['name'], ok=True, elapsed=elapsed, pages=pages, by=origin,
-                        mode='full', reason=skip or None, reason_code=reason_code or None,
-                        phases=phases, chunks=None, log=full_log[-1200:])
-                return {'ok': True, 'time': elapsed,
-                        'mtime': int(os.path.getmtime(pdf_p) * 1000),
-                        'pages': pages, 'log': full_log[-1200:], 'fast': False,
-                        'mode': 'full', 'reason': skip or None,
-                        'reason_code': reason_code or None,
-                        'phases': phases, 'chunks': None, 'by': origin}
-            full_log = (out or '') + '\n' + ((second or ('', ''))[1] or '')
-            errs = [ln for ln in full_log.splitlines()
-                    if ln.startswith('!') or ':error:' in ln or 'Emergency stop' in ln
-                    or 'did not succeed' in ln or 'could not find' in ln]
-            tail = ('\n'.join(errs[-12:]) or full_log[-1500:]) + '\n' + chain
-            err = '编译失败（返回码 %s）' % final_rc
-            phases = {'lock': round(t_lock_end - t_lock, 2),
-                      'plan': round(t_fast - t0, 2),
-                      'full': elapsed, 'total': round(time.time() - t_lock, 2)}
-            _ledger(b['name'], ok=False, elapsed=elapsed, by=origin, mode='full',
-                    reason=skip or None, reason_code=reason_code or None,
-                    phases=phases, error=err, log=tail)
-            return {'ok': False, 'time': elapsed, 'log': tail, 'error': err,
-                    'fast': False, 'mode': 'full', 'reason': skip or None,
-                    'reason_code': reason_code or None,
-                    'phases': phases, 'chunks': None, 'by': origin}
-        except Exception as ex:                 # noqa: BLE001
-            log.exception('整本编译', ex)
-            elapsed = round(time.time() - tf0, 1)
-            msg = ('编译超时（%ss）——首次编译装包或图形宏包可能太慢，'
-                   '可先在 VSCode 里编译一次' % config.COMPILE_TIMEOUT
-                   if 'timeout' in str(ex).lower() else '编译异常：%s: %s' % (type(ex).__name__, ex))
-            _ledger(b['name'], ok=False, elapsed=elapsed, by=origin, mode='full',
-                    reason=skip or None, reason_code=reason_code or None,
-                    error=msg, log=chain)
-            return {'ok': False, 'time': elapsed, 'error': msg, 'log': chain,
-                    'fast': False, 'mode': 'full', 'reason': skip or None,
-                    'reason_code': reason_code or None,
-                    'phases': {'lock': round(t_lock_end - t_lock, 2),
-                               'plan': round(t_fast - t0, 2),
-                               'full': elapsed, 'total': round(time.time() - t_lock, 2)},
-                    'chunks': None, 'by': origin}
-
-
-def _syn_front_ok(syn_p, front):
-    """整本 synctex 是否覆盖 1..front（读不出 / 缺页都算不可用）。"""
-    if not front:
-        return True
-    pages = fastpath.sync_pages(syn_p)
-    return bool(pages) and all(p in pages for p in range(1, int(front) + 1))
-
-
-def _front_guess(book_dir):
-    """前置页数估计：按章缓存优先，其次整本 PDF 的编号章书签。"""
-    try:
-        cache = fastpath.read_cache(book_dir) or {}
-        if cache.get('front') is not None:
-            return int(cache['front'] or 0)
-        outline = fastpath._outline_starts(os.path.join(book_dir, 'main.pdf'))
-        return max(0, int(outline[0]) - 1) if outline else 0
-    except Exception:                           # noqa: BLE001
-        return 0
+        # ---- 失败：直接报错（没有整本兜底可回落）----
+        out_log = (fr or {}).get('log') or skip
+        msg = '编译失败[%s]：%s' % (reason_code or 'unknown', skip or '未给出原因')
+        phases = {'lock': round(t_lock_end - t_lock, 2),
+                  'plan': elapsed, 'total': round(t_fast - t_lock, 2)}
+        log.warn(msg)
+        _write_main_log(book_dir, out_log)
+        _ledger(b['name'], ok=False, elapsed=elapsed, by=origin, mode='fast',
+                reason=skip, reason_code=reason_code, phases=phases,
+                error=msg, log=out_log)
+        return {'ok': False, 'time': elapsed, 'log': out_log, 'error': msg,
+                'fast': True, 'mode': 'fast', 'reason': skip,
+                'reason_code': reason_code, 'phases': phases, 'chunks': None,
+                'by': origin}
 
 
 def _write_main_log(book_dir, text):
-    """快速路径没有 latexmk 的 `.build/main.log`：写一份规范日志，供日志卡读取。"""
+    """快速路径没有整本 latexmk 的 `.build/main.log`：写一份规范日志，供日志卡读取。"""
     try:
         d = os.path.join(book_dir, '.build')
         os.makedirs(d, exist_ok=True)

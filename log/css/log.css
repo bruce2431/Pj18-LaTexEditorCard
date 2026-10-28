@@ -142,3 +142,34 @@ button { font-family: inherit; cursor: pointer; }
 .log-detail { color: var(--ink-faint); margin-bottom: 6px; }
 .log-detail div { white-space: normal; }
 .log-body pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
+
+/* 可点报错行（`块文件:行号:` → 跳到 main.tex 对应行） */
+.lg-link {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.lg-link:hover { background: var(--accent-soft); }
+
+/* 卡内轻提示（单开模式下点了跳转等） */
+.lg-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translate(-50%, 6px);
+  max-width: 82vw;
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: var(--ink);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
+  z-index: 20;
+}
+.lg-toast.show { opacity: 1; transform: translate(-50%, 0); }

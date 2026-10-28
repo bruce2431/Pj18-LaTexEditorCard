@@ -113,6 +113,8 @@ button { font-family: inherit; cursor: pointer; }
 .vt-btn:hover { border-color: transparent; background: var(--accent-soft); color: var(--ink); }
 .vt-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; padding: 5px 15px; }
 .vt-btn.primary:hover { background: var(--accent-deep); border-color: var(--accent-deep); color: var(--accent-fg); }
+/* 编译按钮：定宽 + 等宽数字，编译计时器逐 0.1s 刷新时按钮不左右抖（2026-10-28） */
+#v-compile { min-width: 104px; justify-content: center; font-variant-numeric: tabular-nums; }
 #v-compile:disabled { opacity: .55; cursor: default; }
 /* 顶栏图标按钮（文章目录入口）：同为幽灵形态，方形浅底 */
 .vt-icon {

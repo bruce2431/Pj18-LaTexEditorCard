@@ -7,7 +7,7 @@
 import hashlib
 import os
 
-__version__ = '0.7.0'
+__version__ = '0.8.4'
 
 
 def source_fingerprint():

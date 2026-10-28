@@ -76,10 +76,93 @@
   /* ---------------- 状态 ---------------- */
   const S = {
     book: '',            // 当前书稿名（项目根相对 POSIX 路径）
+    tex: 'main.tex',     // 书稿主 .tex 名（后端 /api/log 给）
+    chunks: [],          // 块起点表 [{name:'ch1.tex', line:main.tex 起始行}]
     recs: [],            // 新 → 旧
     payload: null,       // floria-wk-card-init 带来的上下文 {book,path,error,ts}
     loaded: false,
   };
+
+  /* ---------------- 跳源码：与 PDF 卡同一条宿主协议 ----------------
+     宿主认 floria-pv-event {ev:'src-open', path, line}（PDF 卡点页即如此发）。
+     本卡自包含，不引 PDF 卡的 bridge.js，所以自带这一小段。 */
+  function emitSrcOpen(path, line) {
+    if (!EMBEDDED) { lgToast('单开调试模式：这里不连编辑卡'); return false; }
+    parent.postMessage({ type: 'floria-pv-event', ev: 'src-open', path: path, line: line }, '*');
+    return true;
+  }
+  let toastTimer = null;
+  function lgToast(text) {
+    let el = $('lg-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'lg-toast';
+      el.className = 'lg-toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+  }
+
+  /* 一条日志行 → 可点的 main.tex 行号。
+     分块编译的报错写的是块文件（.build/floria/chunks/ch1.tex:42），行号是块内行号：
+     块第 1 行 = main.tex 第 chunk.line 行，平移回去。wrapper.tex 装的是导言区，
+     行号与 main.tex 一一对应。 */
+  function locFor(file, line) {
+    const ln = parseInt(line, 10) || 0;
+    if (!ln || !S.book) return null;
+    const base = String(file).replace(/\\/g, '/').split('/').pop().toLowerCase();
+    const path = S.book + '/' + (S.tex || 'main.tex');
+    if (base === 'main.tex' || base === 'wrapper.tex') return { path: path, line: ln };
+    const hit = S.chunks.find(c => String(c.name || '').toLowerCase() === base);
+    if (hit) return { path: path, line: ln + (hit.line || 1) - 1 };
+    return null;
+  }
+
+  /* 把日志原文按行画进容器：`.tex:行号:` 与紧跟着的 `l.行号` 渲染成可点片段。
+     其余文本原样保留，容器仍是等宽 pre-wrap。 */
+  const TEX_LOC = /^(.+?\.tex):(\d+):/;
+  const L_LOC = /^l\.(\d+)(?=\s|$)/;
+  function paintLog(el, text) {
+    const rows = String(text == null ? '' : text).split('\n');
+    const frag = document.createDocumentFragment();
+    let lastFile = '';       // 上一行的 `文件:行:` 里的文件：`l.N` 的行号属于同一个文件
+    rows.forEach((row, i) => {
+      if (i) frag.appendChild(document.createTextNode('\n'));
+      let loc = null, head = '';
+      const m = TEX_LOC.exec(row);
+      if (m) {
+        lastFile = m[1];
+        loc = locFor(m[1], m[2]);
+        head = m[0];
+      } else {
+        const l = L_LOC.exec(row);
+        if (l && lastFile) {
+          loc = locFor(lastFile, l[1]);     // `l.N` 的 N 也是块内行号，要同样平移
+          head = l[0];
+        }
+      }
+      if (!loc) { frag.appendChild(document.createTextNode(row)); return; }
+      const a = document.createElement('span');
+      a.className = 'lg-link';
+      a.textContent = head;
+      a.dataset.path = loc.path;
+      a.dataset.line = String(loc.line);
+      a.title = '跳到 ' + loc.path.split('/').pop() + ' 第 ' + loc.line + ' 行';
+      frag.appendChild(a);
+      frag.appendChild(document.createTextNode(row.slice(head.length)));
+    });
+    el.textContent = '';
+    el.appendChild(frag);
+  }
+  document.addEventListener('click', e => {
+    const a = e.target && e.target.closest && e.target.closest('.lg-link');
+    if (!a) return;
+    e.stopPropagation();                 // 别把所在的记录行一起收起/展开
+    emitSrcOpen(a.dataset.path, parseInt(a.dataset.line, 10));
+  });
   const BY_TAG = { page: '页', chapter: '快速', ai: 'AI', disk: '回溯' };
   const BY_TITLE = {
     page: '在本页点「编译」产生的记录',
@@ -161,10 +244,13 @@
       return;
     }
     if (!r || !r.exists) {
+      if (r) S.chunks = Array.isArray(r.chunks) ? r.chunks : [];
       meta.textContent = '尚未生成';
       el.textContent = '还没有 .build/main.log：先在 PDF 卡点一次「编译」。';
       return;
     }
+    S.chunks = Array.isArray(r.chunks) ? r.chunks : [];
+    if (r.tex) S.tex = r.tex;
     meta.textContent = (r.mtime ? fmtStamp(r.mtime / 1000) + ' · ' : '') + fmtSize(r.size);
     let text = String(r.text || '');
     // 超大日志只渲染尾部：真正要看的是报错附近，整份塞进 DOM 会卡住滚动。
@@ -172,7 +258,8 @@
     if (text.length > LIMIT) {
       text = '…（仅显示最后 ' + fmtSize(LIMIT) + '，完整日志见 .build/main.log）\n' + text.slice(-LIMIT);
     }
-    el.textContent = text || '(空日志)';
+    if (!text) { el.textContent = '(空日志)'; return; }
+    paintLog(el, text);
     el.scrollTop = el.scrollHeight;
   }
 
@@ -210,9 +297,12 @@
           ${modeOf(e) ? '<span class="log-by" title="' + esc(modeOf(e).title) + '">' + modeOf(e).text + '</span>' : ''}
           <span class="log-brief">${esc(e.error || '编译通过')}</span>
         </div>
-        <div class="log-body hidden">${detailHtml(e)}<pre>${esc(e.log || '(无输出)')}</pre></div>
+        <div class="log-body hidden">${detailHtml(e)}<pre></pre></div>
       </div>`).join('');
-    el.querySelectorAll('.log-row').forEach(row => {
+    // 日志正文按行画（可点报错行），所以不走 innerHTML 字符串模板
+    el.querySelectorAll('.log-row').forEach((row, i) => {
+      const pre = row.querySelector('.log-body pre');
+      if (pre) paintLog(pre, (S.recs[i] && S.recs[i].log) || '(无输出)');
       row.addEventListener('click', () => toggleRow(row));
     });
   }
@@ -271,9 +361,34 @@
     }
     const records = (hr && hr.records) || [];
     S.recs = records.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    S.newestTs = S.recs.length ? Math.max.apply(null, S.recs.map(r => r.ts || 0)) : 0;
     S.loaded = true;
     render();
     autoExpand();
+  }
+
+  /* 自动跟随编译：编译中每 2.5s 探一次；刚结束 / 出现新记录就自动重载。
+     没有它，在编译途中打开日志卡会一直停在旧记录上——88.7s 的整本编译已经写进账本，
+     页面却还显示上一次的「快速 0.0s」。 */
+  let watchTimer = null;
+  let wasBusy = false;
+  async function tickWatch() {
+    if (!S.book || document.hidden) return;
+    let hr;
+    try { hr = await api('api/history?book=' + encodeURIComponent(S.book)); }
+    catch (e) { return; }
+    if (!hr) return;
+    const busy = !!(hr.compile && hr.compile.status === 'busy');
+    if (busy) { wasBusy = true; return; }
+    if (wasBusy) { wasBusy = false; load(null); return; }
+    const recs = hr.records || [];
+    const newest = recs.length ? Math.max.apply(null, recs.map(r => r.ts || 0)) : 0;
+    if (S.loaded && newest > (S.newestTs || 0)) load(null);
+  }
+  function startWatch() {
+    if (watchTimer) clearInterval(watchTimer);
+    watchTimer = setInterval(tickWatch, 2500);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) tickWatch(); });
   }
 
   function init() {
@@ -291,6 +406,7 @@
     });
 
     load(null);   // 打开即拉历史（无 payload → 解析上次打开的书稿）
+    startWatch(); // 之后自动跟随编译结束 / 新记录
   }
 
   init();

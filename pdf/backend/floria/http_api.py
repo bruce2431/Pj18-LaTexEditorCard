@@ -7,9 +7,30 @@ import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
-from . import books, compiler, config, doctor, ledger, log, synctex
+from . import books, compiler, config, doctor, fastpath, ledger, log, synctex
 
 COMPILER = compiler.CompilerService()
+
+
+def log_chunk_map(book_dir):
+    """日志卡用的块起点表：`{name:'ch1.tex', line:main.tex 起始行}`。
+
+    分块编译的报错写的是块文件（`.build/floria/chunks/ch1.tex:42`），行号是块内行号；
+    块第 1 行 = main.tex 第 `line` 行，前端据此平移回 main.tex。切块信息按当前源码
+    现算——日志若不是最近一次编译留下的，行号可能已有偏移，但不影响定位方向。
+    """
+    try:
+        doc = fastpath.split_document(book_dir)
+    except Exception:                       # noqa: BLE001  解析失败不该拖垮日志读取
+        return []
+    if not doc:
+        return []
+    out = []
+    if (doc.get('front') or '').strip():
+        out.append({'name': fastpath.FRONT_ID + '.tex', 'line': doc['front_line']})
+    for c in doc.get('chunks') or []:
+        out.append({'name': c['id'] + '.tex', 'line': c['line']})
+    return out
 
 NEW_BOOK_TEX = r"""\documentclass[UTF8]{ctexart}
 \usepackage{amsmath,amssymb,graphicx}
@@ -55,7 +76,7 @@ def create_book(name):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'FloriaLaTeX/0.7.0'
+    server_version = 'FloriaLaTeX/0.8.4'
 
     def log_message(self, fmt, *args):
         if self.path.startswith('/api') or self.path.startswith('/img'):
@@ -153,15 +174,17 @@ class Handler(BaseHTTPRequestHandler):
             if not b:
                 return self.send_json({'ok': False, 'error': 'book not found'}, 404)
             p = os.path.join(books.book_dir(b['name']), '.build', 'main.log')
+            cmap = log_chunk_map(books.book_dir(b['name']))
             try:
                 st = os.stat(p)
                 with open(p, 'r', encoding='utf-8', errors='replace') as f:
                     text = f.read()
             except OSError:
-                return self.send_json({'ok': True, 'book': b['name'], 'exists': False,
-                                       'text': '', 'mtime': None, 'size': 0})
-            return self.send_json({'ok': True, 'book': b['name'], 'exists': True,
-                                   'text': text[-2000000:],
+                return self.send_json({'ok': True, 'book': b['name'], 'tex': b['texName'],
+                                       'exists': False, 'text': '', 'mtime': None,
+                                       'size': 0, 'chunks': cmap})
+            return self.send_json({'ok': True, 'book': b['name'], 'tex': b['texName'],
+                                   'exists': True, 'text': text[-2000000:], 'chunks': cmap,
                                    'mtime': int(st.st_mtime * 1000), 'size': st.st_size})
         if path.startswith('/api/read'):
             qs = self.query()
