@@ -76,7 +76,7 @@ def create_book(name):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'FloriaLaTeX/0.8.4'
+    server_version = 'FloriaLaTeX/0.9.0'
 
     def log_message(self, fmt, *args):
         if self.path.startswith('/api') or self.path.startswith('/img'):
@@ -167,6 +167,9 @@ class Handler(BaseHTTPRequestHandler):
             rec = ledger.ledger_read(b['name'], reconcile=qs.get('reconcile') == '1',
                                      lock_probe=COMPILER.state.busy)
             rec['compile'] = COMPILER.snapshot()
+            # 日志卡把账本里每条记录的原始输出渲染成可点行号，需要块起点表与主 .tex 名
+            rec['chunk_map'] = log_chunk_map(books.book_dir(b['name']))
+            rec['tex'] = b['texName']
             return self.send_json(rec)
         if path.startswith('/api/log'):
             qs = self.query()

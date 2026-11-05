@@ -1,8 +1,9 @@
 /* 编译日志卡（多卡片架构，2026-10-18）——自包含：
    不引用 PDF 卡的任何文件，自己实现 $ / esc / api（含反代门票 401 自愈）/ 渲染。
-   数据源 = PDF 卡后端的两条只读接口：
-     · GET /api/log?book=<书稿名>     —— .build/main.log 原文（当前这次编译的原始日志）；
-     · GET /api/history?book=<书稿名> —— 编译记录账本（新→旧，结构 {ok, records:[…]}）。
+   数据源 = PDF 卡后端的一条只读接口：
+     · GET /api/history?book=<书稿名> —— 编译记录账本（新→旧，结构 {ok, records:[…],
+       chunk_map, tex}）。每条记录的 `log` 就是那次编译的原始输出；卡不再单独展示
+       .build/main.log 的「当前日志」。
    历史记录只在本卡实现；PDF 卡不再有日志/历史面板。
    进入方式：
      · 宿主顶栏点「编译日志」tab —— 无 payload，显示账本最近一次（展开）；
@@ -76,8 +77,8 @@
   /* ---------------- 状态 ---------------- */
   const S = {
     book: '',            // 当前书稿名（项目根相对 POSIX 路径）
-    tex: 'main.tex',     // 书稿主 .tex 名（后端 /api/log 给）
-    chunks: [],          // 块起点表 [{name:'ch1.tex', line:main.tex 起始行}]
+    tex: 'main.tex',     // 书稿主 .tex 名（后端 /api/history 的 tex）
+    chunks: [],          // 块起点表 [{name:'ch1.tex', line:main.tex 起始行}]（chunk_map）
     recs: [],            // 新 → 旧
     payload: null,       // floria-wk-card-init 带来的上下文 {book,path,error,ts}
     loaded: false,
@@ -125,12 +126,17 @@
      其余文本原样保留，容器仍是等宽 pre-wrap。 */
   const TEX_LOC = /^(.+?\.tex):(\d+):/;
   const L_LOC = /^l\.(\d+)(?=\s|$)/;
+  // 报错行：`!` 开头，或以 `文件:行:` 开头而尾部就是 TeX 的报错文案
+  const ERR_LOC = /^(?:!|Emergency stop|Fatal error occurred)/;
+  const ERR_TAIL = /(Missing \$ inserted|Undefined control sequence|Emergency stop|Fatal error occurred|Runaway argument|! LaTeX Error|! Package |! Class |Extra \}|Too many \}|Misplaced)/;
   function paintLog(el, text) {
     const rows = String(text == null ? '' : text).split('\n');
     const frag = document.createDocumentFragment();
     let lastFile = '';       // 上一行的 `文件:行:` 里的文件：`l.N` 的行号属于同一个文件
-    rows.forEach((row, i) => {
-      if (i) frag.appendChild(document.createTextNode('\n'));
+    let prevErr = false;     // 上一行是报错：紧随的 `l.N`（出错位置）也标成报错
+    rows.forEach(row => {
+      const line = document.createElement('div');
+      line.className = 'll';
       let loc = null, head = '';
       const m = TEX_LOC.exec(row);
       if (m) {
@@ -144,15 +150,24 @@
           head = l[0];
         }
       }
-      if (!loc) { frag.appendChild(document.createTextNode(row)); return; }
-      const a = document.createElement('span');
-      a.className = 'lg-link';
-      a.textContent = head;
-      a.dataset.path = loc.path;
-      a.dataset.line = String(loc.line);
-      a.title = '跳到 ' + loc.path.split('/').pop() + ' 第 ' + loc.line + ' 行';
-      frag.appendChild(a);
-      frag.appendChild(document.createTextNode(row.slice(head.length)));
+      const err = ERR_LOC.test(row)
+        || (loc != null && ERR_TAIL.test(row.slice(head.length)))
+        || (prevErr && /^l\.\d+/.test(row));
+      if (loc) {
+        const a = document.createElement('span');
+        a.className = 'lg-link';
+        a.textContent = head;
+        a.dataset.path = loc.path;
+        a.dataset.line = String(loc.line);
+        a.title = '跳到 ' + loc.path.split('/').pop() + ' 第 ' + loc.line + ' 行';
+        line.appendChild(a);
+        line.appendChild(document.createTextNode(row.slice(head.length)));
+      } else {
+        line.textContent = row;
+      }
+      if (err) line.classList.add('err');
+      prevErr = err;
+      frag.appendChild(line);
     });
     el.textContent = '';
     el.appendChild(frag);
@@ -194,17 +209,21 @@
   }
   function detailHtml(e) {
     const rows = [];
+    const m = modeOf(e);
+    if (m) rows.push(['模式', m.text + (m.title ? '（' + m.title + '）' : '')]);
     if (e.reason || e.reason_code) {
-      rows.push('整本模式原因：' + esc([e.reason_code, e.reason].filter(Boolean).join(' · ')));
+      rows.push(['整本原因', [e.reason_code, e.reason].filter(Boolean).join(' · ')]);
     }
     const ph = phasesText(e.phases);
-    if (ph) rows.push('耗时分解：' + esc(ph));
+    if (ph) rows.push(['耗时分解', ph]);
     if (e.chunks && e.chunks.total != null) {
-      rows.push('分块：共 ' + esc(e.chunks.total) + '，重编 ' + esc(e.chunks.rebuilt) +
-        '，复用 ' + esc(e.chunks.reused));
+      rows.push(['分块', '共 ' + e.chunks.total + '，重编 ' + e.chunks.rebuilt +
+        '，复用 ' + e.chunks.reused]);
     }
-    return rows.length ? '<div class="log-detail">' + rows.map(r => '<div>' + r + '</div>').join('') +
-      '</div>' : '';
+    return rows.length
+      ? '<dl class="log-detail">' + rows.map(r =>
+        '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join('') + '</dl>'
+      : '';
   }
 
   function bookFromPath(p) {
@@ -229,40 +248,6 @@
     return name;
   }
 
-  /* ---------------- 当前编译日志（.build/main.log） ---------------- */
-  function fmtSize(n) {
-    if (n == null) return '';
-    if (n < 1024) return n + ' B';
-    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-    return (n / 1048576).toFixed(1) + ' MB';
-  }
-  function renderRaw(r, err) {
-    const el = $('lg-raw-text'), meta = $('lg-raw-meta');
-    if (err) {
-      meta.textContent = '读取失败';
-      el.textContent = err.message || String(err);
-      return;
-    }
-    if (!r || !r.exists) {
-      if (r) S.chunks = Array.isArray(r.chunks) ? r.chunks : [];
-      meta.textContent = '尚未生成';
-      el.textContent = '还没有 .build/main.log：先在 PDF 卡点一次「编译」。';
-      return;
-    }
-    S.chunks = Array.isArray(r.chunks) ? r.chunks : [];
-    if (r.tex) S.tex = r.tex;
-    meta.textContent = (r.mtime ? fmtStamp(r.mtime / 1000) + ' · ' : '') + fmtSize(r.size);
-    let text = String(r.text || '');
-    // 超大日志只渲染尾部：真正要看的是报错附近，整份塞进 DOM 会卡住滚动。
-    const LIMIT = 300000;
-    if (text.length > LIMIT) {
-      text = '…（仅显示最后 ' + fmtSize(LIMIT) + '，完整日志见 .build/main.log）\n' + text.slice(-LIMIT);
-    }
-    if (!text) { el.textContent = '(空日志)'; return; }
-    paintLog(el, text);
-    el.scrollTop = el.scrollHeight;
-  }
-
   /* ---------------- 渲染 ---------------- */
   function renderEmpty(title, hint) {
     $('lg-list').innerHTML = '<div class="lg-empty"><p class="le-title">' + esc(title) + '</p>' +
@@ -278,6 +263,13 @@
       el.classList.add('hidden');
     }
   }
+  function metaOf(e) {
+    const bits = ['<span>' + esc(fmtStamp(e.ts)) + '</span>'];
+    bits.push('<span' + (e.elapsed == null ? ' title="这次编译的耗时没有记录（多为由磁盘回溯的旧编译）"' : '') +
+      '>' + (e.elapsed != null ? esc(e.elapsed + 's') : '耗时未知') + '</span>');
+    if (e.pages != null) bits.push('<span>' + esc(e.pages) + ' 页</span>');
+    return bits.join('<span>·</span>');
+  }
   function render() {
     const el = $('lg-list');
     const sec = '<div class="pane-sec"><span class="pane-sec-title">编译记录</span>' +
@@ -287,31 +279,50 @@
         '<p class="le-hint">在 PDF 卡点「编译」后，每次编译的结果与报错都会记在这里。</p></div>';
       return;
     }
-    el.innerHTML = sec + S.recs.map((e, i) => `
-      <div class="log-row${e.ok ? '' : ' bad'}" data-idx="${i}">
-        <div class="log-head">
-          <span class="log-mark">${e.ok ? '✓' : '✕'}</span>
-          <span class="log-time">${esc(fmtStamp(e.ts))}</span>
-          <span class="log-el"${e.elapsed == null ? ' title="这次编译的耗时没有记录（多为由磁盘回溯的旧编译）"' : ''}>${e.elapsed != null ? esc(e.elapsed + 's') : '耗时未知'}</span>
-          ${e.pages != null ? '<span class="log-pages">' + esc(e.pages) + ' 页</span>' : ''}
-          ${modeOf(e) ? '<span class="log-by" title="' + esc(modeOf(e).title) + '">' + modeOf(e).text + '</span>' : ''}
-          <span class="log-brief">${esc(e.error || '编译通过')}</span>
-        </div>
-        <div class="log-body hidden">${detailHtml(e)}<pre></pre></div>
-      </div>`).join('');
+    el.innerHTML = sec + S.recs.map((e, i) => {
+      const m = modeOf(e);
+      return `
+      <div class="log-item${e.ok ? '' : ' bad'}" data-idx="${i}">
+        <button class="log-head" type="button" aria-expanded="false">
+          ${e.ok ? '' : '<span class="log-mark" aria-hidden="true">✕</span>'}
+          <span class="log-main">
+            <span class="log-title">${esc(e.error || '编译通过')}</span>
+            <span class="log-sub">${metaOf(e)}${m ? '<span class="log-chip" title="' +
+              esc(m.title || '') + '">' + esc(m.text) + '</span>' : ''}</span>
+          </span>
+          <svg class="log-caret" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"
+               fill="none" stroke="currentColor" stroke-width="1.6"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M4 6.5 8 10.5 12 6.5"/></svg>
+        </button>
+        <div class="log-body hidden">${detailHtml(e)}<pre class="log-pre"></pre></div>
+      </div>`;
+    }).join('');
     // 日志正文按行画（可点报错行），所以不走 innerHTML 字符串模板
-    el.querySelectorAll('.log-row').forEach((row, i) => {
-      const pre = row.querySelector('.log-body pre');
+    el.querySelectorAll('.log-item').forEach((row, i) => {
+      const pre = row.querySelector('.log-pre');
       if (pre) paintLog(pre, (S.recs[i] && S.recs[i].log) || '(无输出)');
-      row.addEventListener('click', () => toggleRow(row));
+      row.querySelector('.log-head').addEventListener('click', () => toggleRow(row));
     });
   }
   function toggleRow(row, forceOpen) {
     const body = row.querySelector('.log-body');
     if (!body) return;
     const open = forceOpen === undefined ? body.classList.contains('hidden') : !!forceOpen;
+    // 手风琴：同时只展开一条，打开新的自动收起旧的
+    if (open) {
+      $('lg-list').querySelectorAll('.log-item.open').forEach(other => {
+        if (other === row) return;
+        other.classList.remove('open');
+        const b = other.querySelector('.log-body');
+        if (b) b.classList.add('hidden');
+        const h = other.querySelector('.log-head');
+        if (h) h.setAttribute('aria-expanded', 'false');
+      });
+    }
     body.classList.toggle('hidden', !open);
     row.classList.toggle('open', open);
+    const head = row.querySelector('.log-head');
+    if (head) head.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
   // 定位要展开的那条：payload.ts 最近（±30s，编译响应紧跟账本落盘）→ 否则最新一条
   function targetIndex() {
@@ -327,7 +338,9 @@
     return S.recs.length ? 0 : -1;
   }
   function autoExpand() {
-    const rows = $('lg-list').querySelectorAll('.log-row');
+    // 默认全部收起：只有从 PDF 卡编译失败切过来（payload 带 ts）才自动展开那一次
+    if (!(S.payload && S.payload.ts)) return;
+    const rows = $('lg-list').querySelectorAll('.log-item');
     const i = targetIndex();
     if (i < 0 || !rows[i]) return;
     toggleRow(rows[i], true);
@@ -345,20 +358,19 @@
     renderBanner();
     if (!name) {
       S.recs = [];
-      renderRaw(null);
       renderEmpty('没有可显示的书稿', '还没有编译记录：先在 PDF 卡里打开一篇论文并点「编译」。');
       return;
     }
-    const [hr, lr] = await Promise.all([
-      api('api/history?book=' + encodeURIComponent(name)).catch(e => ({ __err: e })),
-      api('api/log?book=' + encodeURIComponent(name)).catch(e => ({ __err: e })),
-    ]);
+    const hr = await api('api/history?book=' + encodeURIComponent(name))
+      .catch(e => ({ __err: e }));
     if (my !== seq) return;
-    renderRaw(lr.__err ? null : lr, lr.__err || null);
     if (hr.__err) {
       renderEmpty('读取编译记录失败', hr.__err.message || String(hr.__err));
       return;
     }
+    // 块起点表用于把块内行号平移回 main.tex（报错行可点跳转）
+    S.chunks = Array.isArray(hr.chunk_map) ? hr.chunk_map : [];
+    if (hr.tex) S.tex = hr.tex;
     const records = (hr && hr.records) || [];
     S.recs = records.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
     S.newestTs = S.recs.length ? Math.max.apply(null, S.recs.map(r => r.ts || 0)) : 0;
@@ -391,7 +403,34 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden) tickWatch(); });
   }
 
+  /* 主题跟随宿主：宿主把 <html data-theme="dark"> 作为唯一真源（白天 = 无该属性），
+     本卡监听它，随宿主切换白天/夜晚。单开调试时退回系统偏好（手动选过则不跟随）。 */
+  function watchTheme() {
+    const apply = v => document.documentElement.setAttribute(
+      'data-theme', v === 'dark' ? 'dark' : 'light');
+    let root = null;
+    try {
+      if (window.parent !== window) root = window.parent.document.documentElement;
+    } catch (e) { /* 跨源宿主：退回系统偏好 */ }
+    if (root) {
+      const sync = () => apply(root.getAttribute('data-theme'));
+      sync();
+      try {
+        new MutationObserver(sync).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+      } catch (e) { /* 观察不到就只保留首帧结果 */ }
+      return;
+    }
+    let saved = null;
+    try { saved = localStorage.getItem('floria-theme'); } catch (e) { /* 隐私模式 */ }
+    if (saved === 'dark' || saved === 'light') return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const sync = () => apply(mq.matches ? 'dark' : 'light');
+    sync();
+    try { mq.addEventListener('change', sync); } catch (e) { /* 老内核 */ }
+  }
+
   function init() {
+    watchTheme();
     // 宿主在 iframe load 后下发的一次性上下文（从 PDF 卡切过来时带 {book,path,error,ts}）
     window.addEventListener('message', e => {
       if (!EMBEDDED || e.source !== window.parent) return;
@@ -401,9 +440,6 @@
     });
 
     $('lg-refresh').addEventListener('click', () => load(null));
-    $('lg-raw-toggle').addEventListener('click', () => {
-      $('lg-raw').classList.toggle('collapsed');
-    });
 
     load(null);   // 打开即拉历史（无 payload → 解析上次打开的书稿）
     startWatch(); // 之后自动跟随编译结束 / 新记录

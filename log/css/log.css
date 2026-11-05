@@ -1,20 +1,44 @@
 /* ============================================================
    编译日志卡（自包含；与 PDF 卡同一套纯黑白 token，但不引用它的文件）
+   浅色 / 深色两套 token 由 <html data-theme="dark"> 切换——跟随宿主主题，
+   单开调试时由 index.html 的预置脚本按 localStorage / 系统偏好落这个属性。
    ============================================================ */
 :root {
+  color-scheme: light;
+
   --bg: #FFFFFF;
-  --bg-soft: #F4F4F4;
   --panel: #FFFFFF;
-  --border: #E2E2E2;
-  --border-soft: #EFEFEF;
+  --bg-soft: #F5F5F5;
+  --border: #E4E4E4;
+  --border-soft: #EEEEEE;
   --ink: #111111;
-  --ink-soft: #6B6B6B;
-  --ink-faint: #A0A0A0;
+  --ink-soft: #606060;
+  --ink-faint: #9B9B9B;
   --accent-soft: #EDEDED;
-  --hover: #F2F2F4;
-  --desk: #EFEFEF;
+  --hover: #F4F4F4;
+  --desk: #F0F0F0;
+  --shadow: rgba(0, 0, 0, .05);
+
   --sans: "Segoe UI", "Microsoft YaHei UI", -apple-system, "PingFang SC", sans-serif;
   --mono: Consolas, "JetBrains Mono", "Cascadia Mono", monospace;
+  --radius: 10px;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #1B1B1B;
+  --panel: #1C1C1C;
+  --bg-soft: #232323;
+  --border: #333333;
+  --border-soft: #2A2A2A;
+  --ink: #ECECEC;
+  --ink-soft: #A8A8A8;
+  --ink-faint: #6E6E6E;
+  --accent-soft: #2C2C2C;
+  --hover: #252525;
+  --desk: #141414;
+  --shadow: rgba(0, 0, 0, .35);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -31,130 +55,234 @@ body {
 .hidden { display: none !important; }
 button { font-family: inherit; cursor: pointer; }
 
-/* 顶栏：与 PDF 卡同款通栏白条（白底 + 底边 1px 发丝线） */
+/* ---------------- 顶栏 ---------------- */
 .lg-top {
   flex: 0 0 48px;
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 12px;
+  padding: 0 14px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
   position: relative;
   z-index: 2;
 }
-.lg-btn {
-  height: 28px;
-  padding: 0 12px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--ink);
-  font-size: 12.5px;
-  line-height: 1;
-  white-space: nowrap;
-}
-.lg-btn:hover { background: var(--accent-soft); }
 .lg-book {
   flex: 1 1 auto;
   min-width: 0;
-  text-align: left;
-  font-size: 12.5px;
-  color: var(--ink-soft);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-variant-numeric: tabular-nums;
 }
+.lg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+.lg-btn:hover { background: var(--hover); color: var(--ink); border-color: var(--accent-soft); }
+.lg-btn svg { display: block; }
 #lg-refresh { margin-left: auto; }
 
-/* 失败上下文横幅（由 floria-wk-card-init 的 payload.error 渲染） */
+/* ---------------- 失败横幅 ---------------- */
 .lg-banner {
   flex: 0 0 auto;
-  padding: 9px 14px;
+  margin: 12px 18px 0;
+  padding: 10px 14px;
   background: var(--bg-soft);
-  border-bottom: 1px solid var(--border-soft);
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--ink);
+  border-radius: 8px;
   font-size: 12.5px;
   color: var(--ink);
-  line-height: 1.6;
+  line-height: 1.65;
   word-break: break-word;
 }
 
-/* 当前编译日志（.build/main.log 原文） */
-.lg-raw { flex: 0 0 auto; background: var(--panel); border-bottom: 1px solid var(--border-soft); }
-.lg-raw-head {
-  width: 100%; display: flex; align-items: baseline; gap: 8px;
-  padding: 10px 14px 6px; background: none; border: 0; text-align: left;
-}
-.lg-raw-title { font-size: 11.5px; font-weight: 600; color: var(--ink-faint); letter-spacing: .4px; }
-.lg-raw-meta { margin-left: auto; font-size: 11px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
-.lg-raw-text {
-  margin: 0 12px 10px; padding: 8px; max-height: 32vh; overflow: auto;
-  background: var(--bg-soft); border-radius: 8px;
-  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
-  white-space: pre-wrap; word-break: break-all;
-}
-.lg-raw.collapsed .lg-raw-text { display: none; }
-
-/* 列表 */
+/* ---------------- 列表 ---------------- */
 .lg-list {
   flex: 1 1 auto;
   overflow: auto;
-  padding: 2px 12px 24px;
+  padding: 4px 18px 40px;
   background: var(--panel);
 }
 
-.pane-sec { display: flex; align-items: baseline; gap: 8px; padding: 14px 2px 6px; }
-.pane-sec-title { font-size: 11.5px; font-weight: 600; color: var(--ink-faint); letter-spacing: .4px; }
-.pane-sec-note { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+.pane-sec {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 16px 2px 8px;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  z-index: 1;
+}
+.pane-sec-title { font-size: 12px; font-weight: 600; color: var(--ink); letter-spacing: .3px; }
+.pane-sec-note {
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 1.5;
+}
 
-.lg-empty { padding: 56px 10px; text-align: center; }
+.lg-empty { padding: 64px 10px; text-align: center; }
 .le-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
-.le-hint { font-size: 12.5px; color: var(--ink-faint); line-height: 1.7; }
+.le-hint { font-size: 12.5px; color: var(--ink-faint); line-height: 1.75; max-width: 34em; margin: 0 auto; }
 
-/* 日志行：发丝分隔的列表行，不是一张张小卡 */
-.log-row {
-  padding: 10px 6px;
+/* ---------------- 记录行 ---------------- */
+.log-item {
+  scroll-margin-top: 46px;            /* 吸附的「编译记录」标题不遮住展开项 */
   border-bottom: 1px solid var(--border-soft);
-  border-radius: 6px;
-  cursor: pointer;
+  border-radius: var(--radius);
+  transition: background .15s ease;
 }
-.log-row:hover { background: var(--hover); }
-.log-row.open { background: var(--hover); }
-.log-head { display: flex; align-items: baseline; gap: 8px; }
-.log-mark { font-size: 12px; font-weight: 700; flex: 0 0 auto; }
-.log-row.bad .log-mark { color: var(--ink); }
-.log-time { font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--ink-soft); flex: 0 0 auto; }
-.log-el { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; flex: 0 0 auto; }
-.log-brief { font-size: 12.5px; color: var(--ink-soft); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.log-by {
-  font-size: 10.5px; color: var(--ink-faint); border: 1px solid var(--border-soft);
-  border-radius: 4px; padding: 0 4px; flex: 0 0 auto; line-height: 1.6;
-}
-.log-body {
-  margin-top: 8px; padding: 8px; max-height: 360px; overflow: auto;
-  background: var(--bg-soft); border-radius: 8px;
-  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
-  white-space: pre-wrap; word-break: break-all;
-}
-.log-pages { font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+.log-item:last-child { border-bottom-color: transparent; }
+.log-item:hover { background: var(--hover); }
+.log-item.open { background: var(--hover); }
 
-.log-detail { color: var(--ink-faint); margin-bottom: 6px; }
-.log-detail div { white-space: normal; }
-.log-body pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
+.log-head {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18px;   /* 通过的记录没有状态点 */
+  align-items: center;
+  gap: 10px;
+  padding: 11px 8px;
+  border: 0;
+  background: none;
+  text-align: left;
+  color: inherit;
+  border-radius: var(--radius);
+}
+.log-item.bad .log-head { grid-template-columns: 20px minmax(0, 1fr) 18px; }
+.log-head:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+
+/* 状态点：只在失败的记录上画（实心圆 + ×） */
+.log-mark {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--ink-soft);
+  background: var(--panel);
+  user-select: none;
+}
+.log-item.bad .log-mark {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--panel);
+  font-weight: 700;
+}
+
+.log-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.log-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-soft);
+  line-height: 1.45;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.log-item.bad .log-title { color: var(--ink); }
+.log-item.bad.open .log-title,
+.log-item.bad .log-head:focus-visible .log-title { white-space: normal; word-break: break-word; }
+
+.log-sub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+}
+.log-sub > span { white-space: nowrap; }
+.log-chip {
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--ink-faint);
+  background: var(--panel);
+}
+.log-item.bad .log-chip { color: var(--ink-soft); border-color: var(--border); }
+
+.log-caret {
+  color: var(--ink-faint);
+  transition: transform .18s ease;
+  flex: 0 0 auto;
+}
+.log-item.open .log-caret { transform: rotate(180deg); }
+
+/* ---------------- 展开区 ---------------- */
+.log-body { padding: 0 8px 12px; }
+.log-item.bad .log-body { padding-left: 38px; }   /* 让开失败标记那一列 */
+.log-detail {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 14px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.log-detail dt { color: var(--ink-faint); font-weight: 400; }
+.log-detail dd { color: var(--ink-soft); word-break: break-word; font-variant-numeric: tabular-nums; }
+
+.log-pre {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 380px;
+  overflow: auto;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+  tab-size: 4;
+}
+.log-pre .ll { min-height: 1.6em; }
+.log-pre .ll.err { color: var(--ink); font-weight: 600; }
+.log-pre .ll.hit { background: var(--accent-soft); border-radius: 3px; }
 
 /* 可点报错行（`块文件:行号:` → 跳到 main.tex 对应行） */
 .lg-link {
   color: var(--ink);
   text-decoration: underline;
   text-decoration-style: dotted;
+  text-decoration-color: var(--ink-faint);
   text-underline-offset: 2px;
   cursor: pointer;
-  border-radius: 2px;
+  border-radius: 3px;
 }
-.lg-link:hover { background: var(--accent-soft); }
+.lg-link:hover { background: var(--accent-soft); text-decoration-color: var(--ink); }
 
-/* 卡内轻提示（单开模式下点了跳转等） */
+/* ---------------- 轻提示 ---------------- */
 .lg-toast {
   position: fixed;
   left: 50%;
@@ -164,7 +292,7 @@ button { font-family: inherit; cursor: pointer; }
   padding: 7px 14px;
   border-radius: 999px;
   background: var(--ink);
-  color: #fff;
+  color: var(--panel);
   font-size: 12px;
   line-height: 1.5;
   opacity: 0;
@@ -173,3 +301,17 @@ button { font-family: inherit; cursor: pointer; }
   z-index: 20;
 }
 .lg-toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* ---------------- 滚动条：跟随主题、更细 ---------------- */
+.lg-list, .log-pre { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.lg-list::-webkit-scrollbar, .log-pre::-webkit-scrollbar { width: 10px; height: 10px; }
+.lg-list::-webkit-scrollbar-thumb, .log-pre::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+.lg-list::-webkit-scrollbar-thumb:hover, .log-pre::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-faint);
+  background-clip: content-box;
+}

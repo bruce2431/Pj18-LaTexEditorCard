@@ -3,7 +3,7 @@
 仿 OpenAI Prism 的个性化 LaTeX 论文预览网页（纯黑白极简）：打开书稿即看 PDF，点 PDF 跳源码，
 改一章只编这一章——**按章并行编译把整本几十秒压到 1~6 秒**。
 
-当前版本 **v0.7.0**。详细机制、目录规范与排障见 [`pdf/backend/README.md`](pdf/backend/README.md)。
+当前版本 **v0.9.0**。详细机制、目录规范与排障见 [`pdf/backend/README.md`](pdf/backend/README.md)。
 
 ## 两种用法
 
@@ -35,8 +35,16 @@ pdf/                    PDF 卡（pdf.js 查看器 / 工具栏 / 编译五态 / 
     runtime/            CPython 3.12 embeddable（发行包内置）
     tex/                MiKTeX Portable + Perl（发行包内置）
     启动.bat            独立运行入口
-log/                    编译日志卡（读 .build/main.log 原文 + 账本时间线；全项目唯一日志实现）
+log/                    编译日志卡（读 /api/history 账本，报错行高亮可跳源码；全项目唯一日志实现）
 ```
+
+## v0.9.0 变更
+
+- **章内 `\newpage` 分块**：章内再按「`\newpage` 紧跟 `\section` / `\subsection`」细分子块，
+  改一节只重编那一块。CHEMISTERY 33 块，改一节约 5 s（原约 30 s），冷编 39 s；
+  133 页 / 152 书签与基线逐项一致。
+- **日志卡改版**：去掉「当前编译日志」独立面板，统一读账本（每条记录自带原始输出）；
+  TeX 报错行整行高亮、紧随的 `l.N` 一并标红；补深浅两套主题 token，跟随宿主切换。
 
 ## v0.7.0 变更
 

@@ -4,6 +4,7 @@
 用户要求：**源文件层次永远只有一本 main.tex**，也**不再有整本 latexmk 兜底**。
 切分全部发生在 `.build/` 里：
   1. 读 main.tex，按顶层 `\\chapter` / `\\chapter*` / `\\part`（必换页）切成若干块；
+     章内再按「`\\newpage` 后紧接 `\\section`/`\\subsection`」细分，改一节只重编一节；
      第一个切点之前是前置页（封面/目录）；一个切点都没有时整篇正文算一块；
   2. 每块 + 原导言区生成 wrapper，独立 xelatex 编译（可并行），注入页码起点、
      章号、分卷号，使页脚/图表编号与整本一致；wrapper 里藏一个 `\\@starttoc{toc}`
@@ -48,6 +49,9 @@ MAX_PARALLEL = max(2, min(9, os.cpu_count() or 4))
 
 _REC = re.compile(r'^([\[\]()hvgk$x])(\d+),(\d+):(.*)$')
 
+# 印页码/标题的引用：跨块时页码取自聚合 aux，整本页码一变就要补编。
+_PAGE_REF_RE = re.compile(r'\\(?:pageref|cpageref|vref|vpageref|nameref)\s*\*?\s*\{')
+
 
 # ---------- 单文件 main.tex 的自动切分 ----------
 def _commented(text, pos):
@@ -91,11 +95,175 @@ def _find_cmd(text, cmd, start=0):
         pos += len(cmd)
 
 
+# 章内再切分：只认「`\newpage` 之后紧接 `\section`/`\subsection`」的位置——
+# 这些地方本来就要换页，切块后版面与整本一致；正文中途的 `\newpage` 不切，
+# 避免浮动体跨页位置漂移。
+_NEWPAGE_RE = re.compile(r'\\newpage\b')
+_AFTER_NEWPAGE_RE = re.compile(r'(?:\s|%[^\n]*\n)*\\(?:section|subsection)\b')
+
+# 分块续接的编号计数器：整本里它们跨段连续，块内从 0 起会把编号印错。
+_COUNTERS = ('section', 'subsection', 'subsubsection', 'figure', 'table',
+             'equation', 'footnote')
+_THEOREM_COUNTERS = ('theorem', 'definition', 'example', 'lemma', 'corollary',
+                     'proposition')
+_ROW_ENVS = ('align', 'gather', 'multline', 'eqnarray', 'flalign', 'alignat')
+
+
+def _count_cmd(text, pat):
+    """数未被注释的匹配个数。"""
+    return sum(1 for m in re.finditer(pat, text) if not _commented(text, m.start()))
+
+
+def _numbered_rows(text, env):
+    """`\\begin{align}` 这类多行公式里真正编号的行数（`\\nonumber`/`\\notag` 不编号）。"""
+    total = 0
+    pat = r'\\begin\{%s\}(.*?)\\end\{%s\}' % (env, env)
+    for m in re.finditer(pat, text, re.S):
+        if _commented(text, m.start()):
+            continue
+        for row in re.split(r'\\\\', m.group(1)):
+            if row.strip() and not re.search(r'\\(?:nonumber|notag)\b', row):
+                total += 1
+    return total
+
+
+def _equation_count(text):
+    """equation 环境与多行公式里累计编号了几条公式。"""
+    n = 0
+    for m in re.finditer(r'\\begin\{equation\}(.*?)\\end\{equation\}', text, re.S):
+        if _commented(text, m.start()):
+            continue
+        if not re.search(r'\\(?:nonumber|notag)\b', m.group(1)):
+            n += 1
+    return n + sum(_numbered_rows(text, e) for e in _ROW_ENVS)
+
+
+def _counter_snapshot(text):
+    """章内切点之前已消耗的编号计数器。
+
+    子块独立编译时计数器从 0 起，必须在 wrapper 里注入这些值，后面紧跟的
+    `\\section` / 图 / 表 / 公式 / 定理才会接着整本的编号走。
+    `\\section` 会重置 subsection、定理类计数器，所以这几项只数「最后一个
+    `\\section` 之后」的部分；figure/table/equation/footnote 按章重置，数全章。
+    """
+    def after_last(pat):
+        pos = -1
+        for m in re.finditer(pat, text):
+            if not _commented(text, m.start()):
+                pos = m.start()
+        return text[pos + 1:] if pos >= 0 else ''
+
+    sec = after_last(r'\\section\b(?!\*)')
+    sub = after_last(r'\\subsection\b(?!\*)')
+    snap = {
+        'section': _count_cmd(text, r'\\section\b(?!\*)'),
+        'subsection': _count_cmd(sec, r'\\subsection\b(?!\*)'),
+        'subsubsection': _count_cmd(sub, r'\\subsubsection\b(?!\*)'),
+        'figure': _count_cmd(text, r'\\begin\{figure\}'),
+        'table': _count_cmd(text, r'\\begin\{table\}'),
+        'equation': _equation_count(text),
+        'footnote': _count_cmd(text, r'\\footnote\b'),
+    }
+    for name in _THEOREM_COUNTERS:
+        snap[name] = _count_cmd(sec, r'\\begin\{%s\}' % name)
+    return snap
+
+
+def _title_arg(text, cmd, start=0):
+    """取 `\\cmd[短标题]{标题}` 的标题参数（支持嵌套花括号）；找不到返回 ''。"""
+    for m in re.finditer(r'\\%s\b(?!\s*\*)\s*' % cmd, text):
+        if m.start() < start or _commented(text, m.start()):
+            continue
+        i = m.end()
+        if i < len(text) and text[i] == '[':
+            j = text.find(']', i)
+            if j < 0:
+                continue
+            i = j + 1
+        while i < len(text) and text[i] in ' \t\r\n':
+            i += 1
+        if i >= len(text) or text[i] != '{':
+            continue
+        depth = 0
+        j = i
+        while j < len(text):
+            ch = text[j]
+            if ch == '\\':          # 跳过 \{ \} 等转义
+                j += 2
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[i + 1:j]
+            j += 1
+    return ''
+
+
+def _last_title_before(text, cmd, pos):
+    """`text[:pos]` 里最后一个 `\\cmd{...}` 的标题。"""
+    last = ''
+    for m in re.finditer(r'\\%s\b(?!\s*\*)\s*' % cmd, text[:pos]):
+        if _commented(text, m.start()):
+            continue
+        t = _title_arg(text, cmd, m.start())
+        if t:
+            last = t
+    return last
+
+
+def _split_at_newpage(text, line, cid, parts, chapter_title=''):
+    """把一章文本按 `\\newpage` 再切开；返回 (第一块文本, 后续子块列表)。
+
+    第一块保留切点处的 `\\newpage` 本身——去掉它会让它前面的段落重排，
+    断行/字距与整本编译不一致。
+    """
+    cuts = []
+    for m in _NEWPAGE_RE.finditer(text):
+        if _commented(text, m.start()) or not _AFTER_NEWPAGE_RE.match(text, m.end()):
+            continue
+        cuts.append((m.start(), m.end()))
+    # 章首就是 \newpage 时不能切出空块：把这次换页留在第一块里。
+    while cuts and not text[:cuts[0][0]].strip():
+        cuts.pop(0)
+    if not cuts:
+        return text, []
+    subs = []
+    for k, (_, a) in enumerate(cuts):
+        b = cuts[k + 1][1] if k + 1 < len(cuts) else len(text)
+        piece = text[a:b]
+        if not piece.strip():
+            continue
+        # 子块首页的页眉取「本页第一个 right mark」：以 \section 开头时应该是
+        # 这一节自己的标题，以 \subsection 开头时沿用上一节。
+        starts_with_section = bool(re.match(
+            r'\s*(?:%[^\n]*\n\s*)*\\section\b(?!\s*\*)', piece))
+        if starts_with_section:
+            head_section = _title_arg(piece, 'section')
+        else:
+            head_section = _last_title_before(text, 'section', a)
+        subs.append({
+            'id': '%s_%d' % (cid, k + 2),
+            'text': piece,
+            'line': line + text.count('\n', 0, a),
+            'starred': True,          # 子块不推进章号
+            'parts': parts,
+            'openright': False,       # 章内子块接上一块继续排，不另起奇数页
+            'counters': _counter_snapshot(text[:a]),
+            # 子块里没有 \chapter，页眉的章名/节名要靠注入 marks 复刻。
+            'marks': {'chapter': chapter_title, 'section': head_section,
+                      'section_next': starts_with_section},
+        })
+    return text[:cuts[0][1]], subs
+
+
 def split_document(book_dir):
     """把 main.tex 切块。返回 {preamble, front, front_line, chunks:[…]} 或 None。
 
     切点 = 顶层 `\\chapter` / `\\chapter*` / `\\part`（都必换页），独立编译版面与
-    整本一致；`\\section` 不换页，按它切会让断行/浮动体/页码整体漂移。
+    整本一致；章内再在「`\\newpage` 紧接 `\\section`/`\\subsection`」处细分，
+    让改一节只重编一节（`\\section` 本身不换页，按它切会让断行/浮动体漂移）。
     没有任何切点时整篇正文当一块（单章 / 无章书稿）。
     """
     return _split_document(book_dir)[0]
@@ -137,19 +305,30 @@ def _split_document(book_dir):
             marks.append((m.start(), 'part'))
 
     if not marks:                            # 单章 / 无章：整篇正文一块，没有前置页
+        text, subs = _split_at_newpage(body, line0, 'ch1', 0,
+                                       _title_arg(body, 'chapter'))
         return {'preamble': preamble, 'front': '', 'front_line': line0,
-                'chunks': [{'id': 'ch1', 'text': body, 'line': line0,
-                            'starred': True, 'parts': 0}]}, None
+                'chunks': [{'id': 'ch1', 'text': text, 'line': line0,
+                            'starred': True, 'parts': 0,
+                            'openright': True, 'counters': {}}] + subs}, None
 
     chunks = []
     parts = 0
     for i, (pos, kind) in enumerate(marks):
         end = marks[i + 1][0] if i + 1 < len(marks) else len(body)
-        chunks.append({'id': 'ch%d' % (i + 1),
-                       'text': body[pos:end],
-                       'line': line0 + body.count('\n', 0, pos),
+        text = body[pos:end]
+        line = line0 + body.count('\n', 0, pos)
+        cid = 'ch%d' % (i + 1)
+        first, subs = _split_at_newpage(text, line, cid, parts,
+                                        _title_arg(text, 'chapter'))
+        chunks.append({'id': cid,
+                       'text': first,
+                       'line': line,
                        'starred': kind != 'chapter',   # 只有 \chapter 推进章号
-                       'parts': parts})
+                       'parts': parts,
+                       'openright': True,
+                       'counters': {}})
+        chunks.extend(subs)
         if kind == 'part':
             parts += 1
     return {'preamble': preamble, 'front': body[:marks[0][0]],
@@ -238,16 +417,20 @@ def _seed_from_synctex(book_dir, chunks):
         return min(good) if good else None
 
     starts = []
-    for h in hits:
+    for c, h in zip(chunks, hits):
         s = solid(h)
-        if s is not None and s % 2 == 0:
-            # openright 下章首必为奇数页：偶数是「章题页记录太少」被阈值挡掉的假首页
+        if s is not None and c.get('openright', True) and s % 2 == 0:
+            # openright 下章首必为奇数页：偶数是「章题页记录太少」被阈值挡掉的假首页。
+            # 章内子块接上一块连续排，可以是偶数页，不校正。
             if h.get(s - 1, 0) >= 2:
                 s -= 1
             elif h.get(s + 1, 0) >= 2:
                 s += 1
         starts.append(s)
-    if any(s is None or s % 2 == 0 for s in starts):
+    if any(s is None for s in starts):
+        return None
+    if any(c.get('openright', True) and s % 2 == 0
+           for c, s in zip(chunks, starts)):
         return None
     if starts != sorted(set(starts)):
         return None
@@ -264,6 +447,8 @@ def _seed_from_pdf(book_dir, chunks):
     """
     if any(c.get('starred') or c.get('parts') for c in chunks):
         return None
+    if any(c.get('openright', True) is False for c in chunks):
+        return None                         # 章内子块没有书签，没法按书签反推
     pdf = os.path.join(book_dir, 'main.pdf')
     if not os.path.isfile(pdf):
         return None
@@ -283,6 +468,12 @@ def _chunk_hash(preamble, chunk):
     h.update(preamble.encode('utf-8', 'replace'))
     h.update(b'\0')
     h.update(chunk['text'].encode('utf-8', 'replace'))
+    # 子块的编号接续前一节：前缀里增删一个 \section/图/公式，本块正文没动
+    # 但印出来的编号会变，指纹里必须带上注入的计数器。
+    counters = chunk.get('counters') or {}
+    if counters:
+        h.update(b'\0')
+        h.update(repr(sorted(counters.items())).encode('utf-8', 'replace'))
     return h.hexdigest()
 
 
@@ -726,19 +917,18 @@ def _read_toc(book_dir, cid):
         return None
 
 
-def _agg_aux(book_dir):
+def _agg_aux(book_dir, chunk_ids):
     """把各块 wrapper.aux 里的 \\newlabel 抄成一份聚合 aux，供跨块 \\ref 使用。
 
     每块的页码计数器已经播成**绝对页码**，所以聚合出来的标签页码与整本一致。
     只抄 \\newlabel：其它行（\\@writefile / 包私有命令）对 xr-hyper 没有意义且可能报错。
+    块 id 由切块结果给出（章内子块是 `chN_M`，不能按 `ch1..ch63` 枚举）。
     """
     lines = []
-    for i in range(1, 64):
-        p = os.path.join(_chunk_dir(book_dir, 'ch%d' % i), 'wrapper.aux')
+    for cid in chunk_ids:
+        p = os.path.join(_chunk_dir(book_dir, cid), 'wrapper.aux')
         if not os.path.isfile(p):
-            if i == 1:
-                continue
-            break
+            continue
         try:
             with open(p, encoding='utf-8', errors='replace') as f:
                 for ln in f:
@@ -747,7 +937,10 @@ def _agg_aux(book_dir):
         except OSError:
             continue
     if lines:
-        _write_if_changed(os.path.join(F_DIR, 'agg', 'main.aux'), '\n'.join(lines) + '\n')
+        # 必须落在 book_dir 下：wrapper 里的 \IfFileExists 是相对 xelatex 的 cwd
+        # （= book_dir）解析的，写成相对进程 cwd 会一路落到后端目录，永远找不到。
+        _write_if_changed(os.path.join(book_dir, F_DIR, 'agg', 'main.aux'),
+                          '\n'.join(lines) + '\n')
 
 
 def _compile_piece(book_dir, cid, preamble, text, inject, env,
@@ -796,7 +989,7 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
     # 本块自引用：`\ref`/`\autoref`/`\eqref`/`\cref` 印的是**编号**（1.2 这种），
     # 起始页平移不会改它；`\pageref`/`\vref`/`\cpageref`/`\nameref` 印页码或标题，
     # 会随页码平移变化 → 块里有它们就退回「整份 aux 稳定」的老判据。
-    page_refs = bool(re.search(r'\\(?:pageref|cpageref|vref|vpageref|nameref)\s*\*?\s*\{', text))
+    page_refs = bool(_PAGE_REF_RE.search(text))
     ref_names = None if page_refs else set(
         m.group(1).strip() for m in re.finditer(r'\\(?:ref|autoref|eqref|cref|Cref)\s*\*?\s*\{([^{}]*)\}',
                                                 text))
@@ -1006,7 +1199,10 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     def chunk_ok(i):
         c = cached[i] if i < len(cached) else {}
         cid = chunks[i]['id']
-        return (isinstance(c.get('pages'), int) and c.get('built') == hashes[i]
+        # id 必须对得上：新增一个切点会让后面所有块的下标平移，只比指纹会把
+        # 错的块当成复用（新块用了旧块的 PDF）。
+        return (c.get('id') == cid
+                and isinstance(c.get('pages'), int) and c.get('built') == hashes[i]
                 and os.path.isfile(_chunk_pdf(book_dir, cid))
                 and _sync_ok(_chunk_sync(book_dir, cid))
                 and os.path.isfile(_toc_path(book_dir, cid)))
@@ -1022,23 +1218,25 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
             kc += 1
 
     def layout(pages, fro):
-        """前置页数与各块页数 → 每块起始页（openright：每块从奇数页起）。"""
+        """前置页数与各块页数 → 每块起始页。
+
+        章首 openright（奇数页起，必要时补空白）；章内子块紧接上一块继续排，
+        不插空白页。
+        """
         out = []
         pos = fro + 1
-        if pos % 2 == 0:                    # 前置页结束在奇数页 → 章首补一张空白
-            pos += 1
         for i in range(n):
+            if chunks[i].get('openright', True) and pos % 2 == 0:
+                pos += 1
             out.append(pos)
             pos += pages[i]
-            if pos % 2 == 0:
-                pos += 1
         return out
 
     texcmd = 'xelatex'                      # 优先 PATH 解析（绝对路径在本机实测慢得多）
     texdir = os.path.dirname(tex) if tex else ''
     xelatex_alt = os.path.join(texdir, 'xelatex.exe') if texdir else ''
     xdvipdfmx_alt = os.path.join(texdir, 'xdvipdfmx.exe') if texdir else ''
-    _agg_aux(book_dir)                      # 跨块 \ref：用上一轮各块产出的标签
+    _agg_aux(book_dir, [c['id'] for c in chunks])  # 跨块 \ref：用上一轮各块产出的标签
 
     front_pages = int(cache.get('front') or 0)
     starts = []
@@ -1060,6 +1258,40 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
              '\\setcounter{page}{%d}') % (chapter_no[i], start_page)
         if part_no[i]:
             s += '\\ifcsname c@part\\endcsname\\setcounter{part}{%d}\\fi' % part_no[i]
+        # 章内子块要接续整本的编号：section/图/表/公式/定理在整本里是连续的，
+        # 子块独立编译会从 0 重新数。
+        snap = chunks[i].get('counters') or {}
+        for name in _COUNTERS + _THEOREM_COUNTERS:
+            if snap.get(name):
+                s += ('\\ifcsname c@%s\\endcsname\\setcounter{%s}{%d}\\fi'
+                      % (name, name, snap[name]))
+        # 页眉的章名/节名由 mark 决定；子块不含 \chapter，必须补回切点前的状态。
+        mk = chunks[i].get('marks') or {}
+        # ctexbook 的页眉按 \CTEX@ifname 决定是否印「第X章」前缀；子块没跑过
+        # \chapter，这个开关还是初始的 false，需要手动置真。
+        if mk.get('chapter') or mk.get('section'):
+            s += ('\\ifcsname CTEX@ifnametrue\\endcsname'
+                  '\\csname CTEX@ifnametrue\\endcsname \\fi')
+        # 页眉取「本页第一个 mark」，而 \chaptermark 会把 right mark 清空，所以
+        # 必须 sectionmark → chaptermark → sectionmark 这样夹着注入：
+        # 首个 mark 决定首页页眉，末个 mark 决定后续页眉。
+        sm = ('\\ifcsname sectionmark\\endcsname\\sectionmark{%s}\\fi'
+              % mk.get('section', ''))
+        if mk.get('section'):
+            if mk.get('section_next'):
+                # mark 在注入当时就把 \CTEXthesection 展开成节号，子块马上要进的
+                # 那一节还没执行；临时把计数器 +1，让首页页眉印出正确节号。
+                s += ('\\ifcsname c@section\\endcsname\\setcounter{section}{%d}\\fi'
+                      % (snap.get('section', 0) + 1))
+            s += sm
+            if mk.get('section_next'):
+                s += ('\\ifcsname c@section\\endcsname\\setcounter{section}{%d}\\fi'
+                      % snap.get('section', 0))
+        if mk.get('chapter'):
+            s += ('\\ifcsname chaptermark\\endcsname'
+                  '\\chaptermark{%s}\\fi' % mk['chapter'])
+        if mk.get('section'):
+            s += sm
         return s
 
     def uses_lastpage(*texts):
@@ -1174,6 +1406,23 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
             front_memo['r'] = r
         return r
 
+    def _agg_sig():
+        """聚合 aux 的当前内容指纹（'' = 还没有这份文件）。"""
+        try:
+            with open(os.path.join(book_dir, F_DIR, 'agg', 'main.aux'), 'rb') as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except OSError:
+            return ''
+
+    def _undefined_ref(cid):
+        """该块的日志里是否还有 `Reference xxx undefined`。"""
+        try:
+            with open(os.path.join(_chunk_dir(book_dir, cid), 'wrapper.log'),
+                      encoding='utf-8', errors='replace') as f:
+                return bool(re.search(r"Reference `.*' .*undefined", f.read()))
+        except OSError:
+            return False
+
     t0 = time.time()
     todo = list(changed)
     master_toc = ''
@@ -1181,6 +1430,7 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     pages = []
     ok_layout = False
     for rounds in range(4):
+        agg_before = _agg_sig()
         errors = compile_chunks(todo, starts)
         if errors and len(todo) > 1 and format_race(errors):
             # 便携 MiKTeX 在缓存/配置变动后，首个 xelatex 会重建 xelatex.fmt；
@@ -1196,6 +1446,26 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
                 log_cb('[并行编译失败] %s\n%s' % (cid, (out or '')[-4000:]))
             return fail('chunk_compile_failed',
                         '块编译失败：%s' % '; '.join(c for c, _ in errors))
+
+        # 跨块引用只读「上一轮」的聚合 aux：本轮刚编的块可能拿到旧页码，或者引用了
+        # 本轮才出现的新标签（印成 ??）。刷新 agg 后把受影响的块补编一遍——只在 agg
+        # 真的变了、且这些块确实带页码引用 / 有未定义引用时才多跑一遍。
+        _agg_aux(book_dir, [c['id'] for c in chunks])
+        if _agg_sig() != agg_before:
+            stale = [i for i in todo
+                     if _PAGE_REF_RE.search(chunks[i]['text'])
+                     or _undefined_ref(chunks[i]['id'])]
+            if stale:
+                if log_cb:
+                    log_cb('[跨块引用] 聚合 aux 已更新，补编：%s'
+                           % ', '.join(chunks[i]['id'] for i in stale))
+                errors = compile_chunks(stale, starts)
+                if errors:
+                    for cid, out in errors:
+                        log_cb('[并行编译失败] %s\n%s' % (cid, (out or '')[-4000:]))
+                    return fail('chunk_compile_failed',
+                                '块编译失败：%s' % '; '.join(c for c, _ in errors))
+                _agg_aux(book_dir, [c['id'] for c in chunks])
 
         pages = []
         for i in range(n):
@@ -1304,7 +1574,7 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     _write_cache(book_dir, {'front': front_pages, 'chunks': newcache,
                             'front_hash': _front_hash(doc['preamble'], doc['front'], master_toc),
                             'ts': round(time.time(), 3)})
-    _agg_aux(book_dir)                      # 供下一次编译的跨块 \ref
+    _agg_aux(book_dir, [c['id'] for c in chunks])  # 供下一次编译的跨块 \ref
     elapsed = round(time.time() - t0, 2)
     log = '\n'.join([
         '[编译链] 自动分章并行（%d 块，重编 %d 块，前置页 %d 页）'

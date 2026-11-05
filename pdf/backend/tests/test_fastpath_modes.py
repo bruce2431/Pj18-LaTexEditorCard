@@ -111,6 +111,80 @@ class SplitModesTest(unittest.TestCase):
         self.assertEqual(code, 'no_begin_document')
 
 
+class NewpageSplitTest(unittest.TestCase):
+    """章内按「`\\newpage` 后紧接标题」再切块：改一节只重编一节。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def split(self, body):
+        d = make_book(self.root, 'b', body)
+        return fastpath._split_document(d)[0]
+
+    def test_split_before_section(self):
+        doc = self.split(
+            '\\chapter{甲}\n甲文\n\\newpage\n\\section{一}\n节文\n'
+            '\\newpage\n\\subsection{小}\n小文\n')
+        self.assertEqual([c['id'] for c in doc['chunks']], ['ch1', 'ch1_2', 'ch1_3'])
+        self.assertTrue(doc['chunks'][0]['openright'])
+        self.assertFalse(doc['chunks'][1]['openright'])
+        # \newpage 留在前一块末尾：去掉它会让前面的段落重排，断行与整本不一致
+        self.assertTrue(doc['chunks'][0]['text'].rstrip().endswith('\\newpage'))
+        self.assertTrue(doc['chunks'][1]['text'].lstrip().startswith('\\section{一}'))
+        # 子块要复刻页眉状态：章名来自 \chapter；节名 = 子块首页页眉该显示的那一节
+        # （\section 开头就是它自己，\subsection 开头则沿用上一节）
+        self.assertEqual(doc['chunks'][1]['marks']['chapter'], '甲')
+        self.assertEqual(doc['chunks'][1]['marks']['section'], '一')
+        self.assertEqual(doc['chunks'][2]['marks']['section'], '一')
+        self.assertTrue(doc['chunks'][2]['text'].lstrip().startswith('\\subsection'))
+
+    def test_newpage_before_body_is_not_a_cut(self):
+        doc = self.split(
+            '\\chapter{甲}\n甲文\n\\newpage\n中间段落\n\\newpage\n\\section{一}\n节文\n')
+        self.assertEqual([c['id'] for c in doc['chunks']], ['ch1', 'ch1_2'])
+        self.assertIn('中间段落', doc['chunks'][0]['text'])
+
+    def test_newpage_before_next_chapter_not_empty_piece(self):
+        doc = self.split('\\chapter{甲}\n甲文\n\\newpage\n\\chapter{乙}\n乙文\n')
+        self.assertEqual([c['id'] for c in doc['chunks']], ['ch1', 'ch2'])
+
+    def test_subchunk_does_not_advance_chapter_number(self):
+        doc = self.split('\\chapter{甲}\n甲\n\\newpage\n\\section{一}\n一\n'
+                         '\\chapter{乙}\n乙\n')
+        self.assertEqual([c['id'] for c in doc['chunks']], ['ch1', 'ch1_2', 'ch2'])
+        self.assertTrue(doc['chunks'][1]['starred'])
+        self.assertFalse(doc['chunks'][2]['starred'])
+
+    def test_counter_snapshot(self):
+        text = (
+            '\\section{甲}\n'
+            '\\begin{figure}x\\end{figure}\n'
+            '\\begin{equation}a\\end{equation}\n'
+            '\\begin{equation}b\\nonumber\\end{equation}\n'
+            '\\subsection{乙}\n'
+            '\\begin{equation}c\\end{equation}\n'
+            '\\begin{align}x&=1\\\\y&=2\\nonumber\\end{align}\n'
+            '\\begin{theorem}t\\end{theorem}\n'
+        )
+        s = fastpath._counter_snapshot(text)
+        self.assertEqual(s['section'], 1)
+        self.assertEqual(s['subsection'], 1)
+        self.assertEqual(s['figure'], 1)
+        # 1 equation + 1 equation + align 1 行编号（另一行 \nonumber）
+        self.assertEqual(s['equation'], 3)
+        self.assertEqual(s['theorem'], 1)
+
+    def test_hash_includes_counters(self):
+        c = {'text': '\\section{一}正文', 'counters': {'section': 1}}
+        d = dict(c, counters={'section': 2})
+        self.assertNotEqual(fastpath._chunk_hash('pre', c),
+                            fastpath._chunk_hash('pre', d))
+
+
 class TocParseTest(unittest.TestCase):
     """分块编出的 wrapper.toc 决定书签树：绝对页码 + 层级嵌套。"""
 

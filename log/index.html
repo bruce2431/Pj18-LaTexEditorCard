@@ -4,34 +4,57 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>编译日志</title>
-<link rel="stylesheet" href="css/log.css?v=1.4.0">
+<!-- 主题预置（必须排在样式表之前，避免首帧闪白/闪黑）：
+     嵌入宿主时以宿主的 <html data-theme> 为准（宿主白天 = 无该属性，夜晚 = "dark"）；
+     单开调试时依次退回 localStorage['floria-theme']、系统 prefers-color-scheme。
+     宿主里切换主题由 log.js 的 MutationObserver 跟随。 -->
+<script>
+  (function () {
+    var dark = null;
+    try {
+      if (window.parent !== window && window.parent.document &&
+          window.parent.document.documentElement) {
+        var t = window.parent.document.documentElement.getAttribute('data-theme');
+        dark = t === 'dark';                     // 宿主白天模式 = 没有该属性
+      }
+    } catch (e) { /* 跨源拿不到宿主：退回本地判定 */ }
+    if (dark === null) {
+      try {
+        var saved = localStorage.getItem('floria-theme');
+        if (saved === 'dark') dark = true;
+        else if (saved === 'light') dark = false;
+      } catch (e) { /* 存储不可用 */ }
+    }
+    if (dark === null) dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+  })();
+</script>
+<link rel="stylesheet" href="css/log.css?v=1.5.4">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23111111'/><text x='50' y='68' font-size='52' text-anchor='middle' font-family='Georgia' fill='white'>L</text></svg>">
 </head>
 <body>
 
 <!-- 编译日志卡：自包含（不引用 PDF 卡的任何文件）。
-     数据 = GET /api/log?book=…（.build/main.log 原文）+ GET /api/history?book=…（编译记录账本）。
+     数据 = GET /api/history?book=…（编译记录账本，含块起点表 chunk_map）。
      进入方式 = 宿主顶栏 tab，或 PDF 卡编译失败时 floria-wk-card-switch；payload 经 floria-wk-card-init 传入。
      卡间切换一律由宿主顶栏完成，本卡不含任何「返回」按钮；历史记录只在本卡实现。 -->
 <header class="lg-top">
   <div class="lg-book" id="lg-book"></div>
-  <button class="lg-btn" id="lg-refresh" title="重新读取编译记录">刷新</button>
+  <button class="lg-btn" id="lg-refresh" title="重新读取编译记录">
+    <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
+         stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5V5H11"/>
+    </svg>
+    <span>刷新</span>
+  </button>
 </header>
 
 <div id="lg-banner" class="lg-banner hidden"></div>
-
-<section id="lg-raw" class="lg-raw">
-  <button class="lg-raw-head" id="lg-raw-toggle">
-    <span class="lg-raw-title">当前编译日志</span>
-    <span class="lg-raw-meta" id="lg-raw-meta"></span>
-  </button>
-  <pre id="lg-raw-text" class="lg-raw-text">读取中…</pre>
-</section>
 
 <main id="lg-list" class="lg-list">
   <div class="lg-empty"><p class="le-title">读取编译记录…</p></div>
 </main>
 
-<script src="js/log.js?v=1.4.0"></script>
+<script src="js/log.js?v=1.5.7"></script>
 </body>
 </html>
