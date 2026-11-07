@@ -437,6 +437,11 @@
 
   function init() {
     watchTheme();
+    // 向宿主申报入场（宿主据此登记本帧命名空间，之后的广播才投递得进来；
+    // 迟入场时宿主还会补发最近一次 file-open）。
+    if (EMBEDDED) {
+      try { parent.postMessage({ type: 'floria-pv-event', ev: 'ready' }, '*'); } catch (e) { /* 帧已拆 */ }
+    }
     window.addEventListener('message', e => {
       if (!EMBEDDED || e.source !== window.parent) return;
       const d = e.data;
