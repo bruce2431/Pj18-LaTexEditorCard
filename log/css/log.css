@@ -68,7 +68,7 @@ button { font-family: inherit; cursor: pointer; }
   z-index: 2;
 }
 .lg-book {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   font-size: 13px;
   font-weight: 600;
@@ -94,6 +94,18 @@ button { font-family: inherit; cursor: pointer; }
 }
 .lg-btn:hover { background: var(--hover); color: var(--ink); border-color: var(--accent-soft); }
 .lg-btn svg { display: block; }
+.lg-count {
+  flex: 0 0 auto;
+  margin-right: auto;
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
 #lg-refresh { margin-left: auto; }
 
 /* ---------------- 失败横幅 ---------------- */
@@ -115,29 +127,8 @@ button { font-family: inherit; cursor: pointer; }
 .lg-list {
   flex: 1 1 auto;
   overflow: auto;
-  padding: 4px 18px 40px;
+  padding: 8px 18px 40px;
   background: var(--panel);
-}
-
-.pane-sec {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 16px 2px 8px;
-  position: sticky;
-  top: 0;
-  background: var(--panel);
-  z-index: 1;
-}
-.pane-sec-title { font-size: 12px; font-weight: 600; color: var(--ink); letter-spacing: .3px; }
-.pane-sec-note {
-  font-size: 11px;
-  color: var(--ink-faint);
-  font-variant-numeric: tabular-nums;
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  padding: 0 6px;
-  line-height: 1.5;
 }
 
 .lg-empty { padding: 64px 10px; text-align: center; }
@@ -146,7 +137,7 @@ button { font-family: inherit; cursor: pointer; }
 
 /* ---------------- 记录行 ---------------- */
 .log-item {
-  scroll-margin-top: 46px;            /* 吸附的「编译记录」标题不遮住展开项 */
+  scroll-margin-top: 8px;
   border-bottom: 1px solid var(--border-soft);
   border-radius: var(--radius);
   transition: background .15s ease;

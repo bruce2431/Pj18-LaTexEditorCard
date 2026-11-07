@@ -249,7 +249,14 @@
   }
 
   /* ---------------- 渲染 ---------------- */
+  function setCount(n) {
+    const el = $('lg-count');
+    if (!el) return;
+    el.textContent = n == null ? '' : '编译记录 ' + n;
+    el.hidden = n == null;
+  }
   function renderEmpty(title, hint) {
+    setCount(null);
     $('lg-list').innerHTML = '<div class="lg-empty"><p class="le-title">' + esc(title) + '</p>' +
       (hint ? '<p class="le-hint">' + esc(hint) + '</p>' : '') + '</div>';
   }
@@ -272,14 +279,13 @@
   }
   function render() {
     const el = $('lg-list');
-    const sec = '<div class="pane-sec"><span class="pane-sec-title">编译记录</span>' +
-      '<span class="pane-sec-note">' + S.recs.length + '</span></div>';
+    setCount(S.recs.length);
     if (!S.recs.length) {
-      el.innerHTML = sec + '<div class="lg-empty"><p class="le-title">还没有编译记录</p>' +
+      el.innerHTML = '<div class="lg-empty"><p class="le-title">还没有编译记录</p>' +
         '<p class="le-hint">在 PDF 卡点「编译」后，每次编译的结果与报错都会记在这里。</p></div>';
       return;
     }
-    el.innerHTML = sec + S.recs.map((e, i) => {
+    el.innerHTML = S.recs.map((e, i) => {
       const m = modeOf(e);
       return `
       <div class="log-item${e.ok ? '' : ' bad'}" data-idx="${i}">
@@ -431,12 +437,18 @@
 
   function init() {
     watchTheme();
-    // 宿主在 iframe load 后下发的一次性上下文（从 PDF 卡切过来时带 {book,path,error,ts}）
     window.addEventListener('message', e => {
       if (!EMBEDDED || e.source !== window.parent) return;
       const d = e.data;
-      if (!d || typeof d !== 'object' || d.type !== 'floria-wk-card-init') return;
-      load(d.payload || null);
+      if (!d || typeof d !== 'object') return;
+      // 宿主在 iframe load 后下发的一次性上下文（从 PDF 卡切过来时带 {book,path,error,ts}）
+      if (d.type === 'floria-wk-card-init') { load(d.payload || null); return; }
+      // 用户点开另一篇 .tex：宿主广播 file-open，本卡跟着换书稿（与 PDF 卡同一协议）
+      if ((d.type === 'floria-pv-broadcast' || d.type === 'floria-pv-event') &&
+          d.ev === 'file-open') {
+        const book = bookFromPath(d.path || d.book);
+        if (book && book !== S.book) load({ book: book, path: d.path });
+      }
     });
 
     $('lg-refresh').addEventListener('click', () => load(null));

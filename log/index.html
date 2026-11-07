@@ -29,7 +29,7 @@
     if (dark) document.documentElement.setAttribute('data-theme', 'dark');
   })();
 </script>
-<link rel="stylesheet" href="css/log.css?v=1.5.4">
+<link rel="stylesheet" href="css/log.css?v=1.5.6">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23111111'/><text x='50' y='68' font-size='52' text-anchor='middle' font-family='Georgia' fill='white'>L</text></svg>">
 </head>
 <body>
@@ -40,6 +40,7 @@
      卡间切换一律由宿主顶栏完成，本卡不含任何「返回」按钮；历史记录只在本卡实现。 -->
 <header class="lg-top">
   <div class="lg-book" id="lg-book"></div>
+  <span class="lg-count" id="lg-count" hidden></span>
   <button class="lg-btn" id="lg-refresh" title="重新读取编译记录">
     <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
          stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -55,6 +56,6 @@
   <div class="lg-empty"><p class="le-title">读取编译记录…</p></div>
 </main>
 
-<script src="js/log.js?v=1.5.7"></script>
+<script src="js/log.js?v=1.5.9"></script>
 </body>
 </html>
