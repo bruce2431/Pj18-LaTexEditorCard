@@ -10,7 +10,9 @@
 1. **作为 Floria 预览卡**：把整个目录放到项目的 `.claude/preview/`，`preview.json` 的 `backend`
    段声明了 `cwd: "pdf/backend"`，网关会按需拉起 `server.py`，随后以 `/backend/<label>/pdf/index.html` 反代。
 2. **独立运行**：双击 `pdf/backend/启动.bat` → 浏览器打开
-   `http://127.0.0.1:8765/pdf/index.html`（日志卡：`/log/index.html`）。
+   `http://127.0.0.1:8765/pdf/index.html`。
+
+编译日志卡已拆分为独立仓库：[`Pj18-LaTexLogCard`](https://github.com/bruce2431/Pj18-LaTexLogCard)。
 
 ## 发行包
 
@@ -35,8 +37,10 @@ pdf/                    PDF 卡（pdf.js 查看器 / 工具栏 / 编译五态 / 
     runtime/            CPython 3.12 embeddable（发行包内置）
     tex/                MiKTeX Portable + Perl（发行包内置）
     启动.bat            独立运行入口
-log/                    编译日志卡（读 /api/history 账本，报错行高亮可跳源码；全项目唯一日志实现）
 ```
+
+编译日志卡不在本仓库，见 [Pj18-LaTexLogCard](https://github.com/bruce2431/Pj18-LaTexLogCard)；
+部署时把它放到项目的 `.claude/preview/log/`。
 
 ## v0.9.0 变更
 
