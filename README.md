@@ -3,7 +3,7 @@
 仿 OpenAI Prism 的个性化 LaTeX 论文预览网页（纯黑白极简）：打开书稿即看 PDF，点 PDF 跳源码，
 改一章只编这一章——**按章并行编译把整本几十秒压到 1~6 秒**。
 
-当前版本 **v0.9.0**。详细机制、目录规范与排障见 [`pdf/backend/README.md`](pdf/backend/README.md)。
+当前版本 **v0.9.4**。详细机制、目录规范与排障见 [`pdf/backend/README.md`](pdf/backend/README.md)。
 
 ## 两种用法
 

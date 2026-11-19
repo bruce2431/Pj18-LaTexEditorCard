@@ -76,7 +76,7 @@ def create_book(name):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'FloriaLaTeX/0.9.1'
+    server_version = 'FloriaLaTeX/0.9.4'
 
     def log_message(self, fmt, *args):
         if self.path.startswith('/api') or self.path.startswith('/img'):
