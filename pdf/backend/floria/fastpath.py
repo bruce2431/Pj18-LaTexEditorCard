@@ -465,14 +465,59 @@ def _seed_from_pdf(book_dir, chunks):
     return front, list(pages)
 
 
-def _chunk_hash(preamble, chunk):
+_COUNTER_USE_RE = {
+    'figure': re.compile(r'\\begin\{figure|\{figure\}|\\thefigure'),
+    'table': re.compile(r'\\begin\{(?:long)?table|\{table\}|\\thetable'),
+    'equation': re.compile(
+        r'\\begin\{(?:sub)?(?:equation|align|gather|multline|flalign|alignat|eqnarray)\}'
+        r'|\{equation\}|\\theequation'
+    ),
+    'footnote': re.compile(r'\\footnote|\\footnotemark|\\footnotetext|\{footnote\}|\\thefootnote'),
+    'subsection': re.compile(r'\\sub(?:sub)?section\b|\{subsection\}|\\thesubsection'),
+    'subsubsection': re.compile(r'\\subsubsection\b|\{subsubsection\}|\\thesubsubsection'),
+}
+_THEOREM_USE_RE = re.compile(
+    r'\\begin\{(?:' + '|'.join(_THEOREM_COUNTERS) + r')\}|\{(?:'
+    + '|'.join(_THEOREM_COUNTERS) + r')\}|\\the(?:' + '|'.join(_THEOREM_COUNTERS) + r')\b'
+)
+
+
+def _relevant_counters(chunk):
+    """过滤出本块实际可能观察到的前置计数器，避免无关计数器变更引发级联重编。
+
+    例如在 ch1 增删一个 table 时，不含任何 table 环境的下游子块 ch1_2 无需重编；
+    以 \\section 开头的子块会立刻重置 subsection/subsubsection，也不受前置小节数影响。
+    """
+    counters = chunk.get('counters') or {}
+    if not counters:
+        return {}
+    text = chunk.get('text') or ''
+    starts_sec = bool((chunk.get('marks') or {}).get('section_next'))
+    has_thm = bool(_THEOREM_USE_RE.search(text))
+    kept = {}
+    for k, v in counters.items():
+        if k == 'section':
+            kept[k] = v
+        elif k in _THEOREM_COUNTERS:
+            if has_thm:
+                kept[k] = v
+        elif k in ('subsection', 'subsubsection'):
+            if not starts_sec and _COUNTER_USE_RE[k].search(text):
+                kept[k] = v
+        else:
+            pat = _COUNTER_USE_RE.get(k)
+            if pat is None or pat.search(text):
+                kept[k] = v
+    return kept
+
+
+def _chunk_hash(preamble, chunk, filter_counters=True):
     h = hashlib.md5()
     h.update(preamble.encode('utf-8', 'replace'))
     h.update(b'\0')
     h.update(chunk['text'].encode('utf-8', 'replace'))
-    # 子块的编号接续前一节：前缀里增删一个 \section/图/公式，本块正文没动
-    # 但印出来的编号会变，指纹里必须带上注入的计数器。
-    counters = chunk.get('counters') or {}
+    # 子块的编号接续前一节：仅纳入本块真正用到的计数器，避免删一张表导致无表子块重编。
+    counters = _relevant_counters(chunk) if filter_counters else (chunk.get('counters') or {})
     if counters:
         h.update(b'\0')
         h.update(repr(sorted(counters.items())).encode('utf-8', 'replace'))
@@ -943,29 +988,59 @@ def _merge_key(items):
     return h.hexdigest()
 
 
-def _merge_synctex_cached(items, out):
-    """带缓存的 SyncTeX 合并：优先走预处理 `.slim` 极速路径（~0.08s）。"""
+def _synctex_cache_paths(out):
     book_dir = os.path.dirname(os.path.dirname(out))
     cache = os.path.join(book_dir, F_DIR, 'synctex_merged.gz')
-    sidecar = cache + '.key'
+    return cache, cache + '.key'
+
+
+def _synctex_cache_hit(items, out):
+    """命中已合并 SyncTeX 缓存时直接复制并返回 True，否则返回 False。"""
+    cache, sidecar = _synctex_cache_paths(out)
     key = _merge_key(items)
     try:
         with open(sidecar, 'r', encoding='utf-8') as f:
             if f.read().strip() == key and os.path.isfile(cache):
                 shutil.copyfile(cache, out)
-                return False
+                return True
     except OSError:
         pass
-    if all(it.get('slim') for it in items):
-        _merge_synctex_fast(items, out)
-    else:
-        _merge_synctex(items, out)
+    return False
+
+
+def _synctex_cache_save(items, out):
+    cache, sidecar = _synctex_cache_paths(out)
+    key = _merge_key(items)
     try:
         shutil.copyfile(out, cache)
         with open(sidecar, 'w', encoding='utf-8') as f:
             f.write(key)
     except OSError as ex:                   # noqa: BLE001
         log.warn('写 synctex 合并缓存失败：%s' % ex)
+
+
+def _ensure_slim_items(items):
+    """确保所有带 slim 路径的项都有完整 `.slim` 缓存；全部就绪返回 True。"""
+    if not items or not all(it.get('slim') for it in items):
+        return False
+    for it in items:
+        slim = it['slim']
+        if not _slim_sync_ok(slim):
+            _build_slim_synctex(it['path'], slim, it.get('chunk_name'),
+                                max_pages=it.get('max_pages'))
+    return True
+
+
+def _merge_synctex_cached(items, out):
+    """带缓存的 SyncTeX 合并：优先走 Rust 原生合并，其次预处理 `.slim` 极速路径。"""
+    if _synctex_cache_hit(items, out):
+        return False
+    if _ensure_slim_items(items):
+        if pdf_stamp.run_native_merge(synctex_args=(items, out)) is None:
+            _merge_synctex_fast(items, out)
+    else:
+        _merge_synctex(items, out)
+    _synctex_cache_save(items, out)
     return True
 
 
@@ -1583,9 +1658,13 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
             return False
         c = cached[i] if i < len(cached) else {}
         cid = chunks[i]['id']
+        built = c.get('built')
+        hash_ok = (built == hashes[i]
+                   or (built is not None
+                       and built == _chunk_hash(doc['preamble'], chunks[i], filter_counters=False)))
         if not (c.get('id') == cid
                 and isinstance(c.get('pages'), int) and c['pages'] >= 1
-                and c.get('built') == hashes[i]
+                and hash_ok
                 and c.get('xref') == xrefs[i]
                 and os.path.isfile(_chunk_pdf(book_dir, cid))
                 and _chunk_sync_ready(cid)
@@ -2166,27 +2245,55 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
                       'offset': offsets[i],
                       'chunk_name': cid + '.tex', 'chunk_line': chunks[i]['line']})
 
-    # 顺序执行 PDF 盖印合并（~0.5s）与 SyncTeX 极速合并（~0.15s）：
-    # 两者均为纯 Python CPU 密集任务，实测顺序执行比双线程（受 GIL 争用约 1.26s）快一倍。
+    # 优先单次调用 Rust 原生合并器并发完成 PDF 盖印合并与 SyncTeX 合并（~80ms，零 GIL 争用）；
+    # SyncTeX 已命中缓存时仅跑 PDF 合并；原生二进制不可用时自动回退纯 Python 路径。
     t_pdf0 = time.time()
+    native_used = False
+    sync_done = False
+    total_pages = 0
     try:
-        if decoupled:
-            total_pages = pdf_stamp.stamp_and_merge_pdfs(
-                parts, merged, kit_info, outline=outline,
-                toc_pages=toc_pages, label_pages=label_pages)
-        else:
-            total_pages = _merge_pdfs(parts, merged, outline=outline)
+        if decoupled and pdf_stamp.find_native_merger():
+            sync_hit = _synctex_cache_hit(items, sync_tmp)
+            if sync_hit:
+                sync_done = True
+                res = pdf_stamp.run_native_merge(
+                    pdf_args=(parts, merged, kit_info, outline, toc_pages, label_pages)
+                )
+            elif _ensure_slim_items(items):
+                res = pdf_stamp.run_native_merge(
+                    pdf_args=(parts, merged, kit_info, outline, toc_pages, label_pages),
+                    synctex_args=(items, sync_tmp),
+                )
+                if res is not None:
+                    sync_done = True
+                    _synctex_cache_save(items, sync_tmp)
+            else:
+                res = pdf_stamp.run_native_merge(
+                    pdf_args=(parts, merged, kit_info, outline, toc_pages, label_pages)
+                )
+            if res is not None:
+                total_pages = int(res.get('total_pages') or 0)
+                native_used = True
+
+        if not native_used:
+            if decoupled:
+                total_pages = pdf_stamp.stamp_and_merge_pdfs(
+                    parts, merged, kit_info, outline=outline,
+                    toc_pages=toc_pages, label_pages=label_pages)
+            else:
+                total_pages = _merge_pdfs(parts, merged, outline=outline)
     except Exception as ex:                 # noqa: BLE001
         return fail('merge_pdf_failed', '拼 PDF/重建书签失败：%s' % ex)
     t_pdf = time.time()
 
     t_sync0 = time.time()
-    try:
-        _merge_synctex_cached(items, sync_tmp)
-    except Exception as ex:                 # noqa: BLE001
-        if log_cb:
-            log_cb('[synctex 合并失败] %s' % ex)
-        return fail('synctex_merge_failed', 'synctex 合并失败：%s' % ex)
+    if not sync_done:
+        try:
+            _merge_synctex_cached(items, sync_tmp)
+        except Exception as ex:             # noqa: BLE001
+            if log_cb:
+                log_cb('[synctex 合并失败] %s' % ex)
+            return fail('synctex_merge_failed', 'synctex 合并失败：%s' % ex)
     t_sync = time.time()
 
     # PDF 与 synctex 都合并成功后才落盘：任一失败都不替换成品，
@@ -2224,14 +2331,15 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
         _agg_aux(book_dir, [c['id'] for c in chunks])
     elapsed = round(time.time() - t0, 2)
     mode_tag = '页码解耦并行' if decoupled else '自动分章并行'
+    merge_tag = ('Rust 原生盖印+热更新' if native_used
+                 else ('原位盖印+热更新' if decoupled else 'pypdf'))
     log = '\n'.join([
         '[编译链] %s（%d 块，重编 %d 块，前置页 %d 页）'
         % (mode_tag, n, rebuilt, front_pages),
         '[编译链] 未变块复用缓存：%s'
         % (', '.join(chunks[i]['id'] for i in range(n) if i not in rebuilt_set) or '无'),
         '[编译链] 拼接 %d 个 PDF（%s）+ 按目录条目重建书签（%d 项）'
-        % (n + (1 if front_pages else 0),
-           '原位盖印+热更新' if decoupled else 'pypdf', len(outline)),
+        % (n + (1 if front_pages else 0), merge_tag, len(outline)),
         '[编译链] 各块起始页：%s'
         % ' / '.join('%s=%d' % (chunks[i]['id'], starts[i]) for i in range(n)),
     ])

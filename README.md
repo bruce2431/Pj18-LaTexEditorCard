@@ -3,7 +3,7 @@
 仿 OpenAI Prism 的个性化 LaTeX 论文预览网页（纯黑白极简）：打开书稿即看 PDF，点 PDF 跳源码，
 改一章只编这一章——**按章并行编译把整本几十秒压到 1~6 秒**。
 
-当前版本 **v0.9.4**。详细机制、目录规范与排障见 [`pdf/backend/README.md`](pdf/backend/README.md)。
+当前版本 **v1.0.0**。详细机制、目录规范与排障见 [`pdf/backend/README.md`](pdf/backend/README.md)。
 
 ## 两种用法
 
@@ -21,6 +21,7 @@ Release 附件 **解压即用**，已内置：
 - `pdf/backend/runtime/` CPython 3.12.10 embeddable（不需要机器上装 Python）
 - `pdf/backend/vendor/` pypdf 6.21.2（快速并行编译的 PDF 拼接依赖）
 - `pdf/backend/tex/` MiKTeX Portable 26.5 + Perl（离线可编，已关闭自动装包）
+- `pdf/backend/native/bin/floria_merge.exe` Rust 原生合并器（缺失时自动回退纯 Python 路径）
 
 解压后把整个目录放到 `<你的项目>/.claude/preview/`，项目根下每个含 `.tex` 的目录自动成为一篇书稿。
 
@@ -31,7 +32,8 @@ preview.json            网关 backend 清单（唯一入口配置）
 pdf/                    PDF 卡（pdf.js 查看器 / 工具栏 / 编译五态 / 点 PDF 跳源码）
   backend/              编译进程与 HTTP API 归属 PDF 卡
     server.py           本地服务器：静态托管 + /api/books|read|write|compile|pdf|sync|newbook|history|log
-    floria/             编译链（fastpath / compiler / ledger / synctex / locks / toolchain）
+    floria/             编译链（fastpath / compiler / pdf_stamp / ledger / synctex / locks / toolchain）
+    native/             Rust 原生合并器源码（floria_merge）+ native/bin 预编译产物
     tests/              模式选择单测 + 真实 TeX 集成回归
     vendor/pypdf/       纯 Python 依赖
     runtime/            CPython 3.12 embeddable（发行包内置）
@@ -41,6 +43,18 @@ pdf/                    PDF 卡（pdf.js 查看器 / 工具栏 / 编译五态 / 
 
 编译日志卡不在本仓库，见 [Pj18-LaTexLogCard](https://github.com/bruce2431/Pj18-LaTexLogCard)；
 部署时把它放到项目的 `.claude/preview/log/`。
+
+## v1.0.0 变更
+
+- **Rust 原生合并器**：新增 `pdf/backend/native/floria_merge`，一次调用并发完成 PDF
+  盖印合并与 SyncTeX 合并（约 80 ms，零 GIL 争用），取代原先纯 Python 的 pypdf 拼接
+  （约 0.5 s）加 SyncTeX 合并（约 0.15 s）；二进制缺失或执行失败时自动回退原路径，
+  产出逐字节一致。
+- **计数器按需滤波**：块指纹只纳入该块正文真正用到的计数器，删一张表不再连带重编
+  不含表的子块；以 `\section` 开头的子块忽略前置小节计数。旧指纹仍可命中，不会因
+  升级触发全量重编。
+- **SyncTeX 缓存流程重构**：命中判断与写回拆为独立步骤，`.slim` 预处理缓存缺失时
+  自动补建；缓存命中时只跑 PDF 合并。
 
 ## v0.9.0 变更
 

@@ -1,0 +1,18 @@
+[package]
+name = "floria_merge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lopdf = { version = "0.47", default-features = false, features = ["rayon"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+rayon = "1.12"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -403,5 +403,69 @@ class TikzCacheTest(unittest.TestCase):
         self.assertEqual(spans[0][3], '')
 
 
+class CounterFilterAndNativeTest(unittest.TestCase):
+    """块计数器按需过滤哈希 + Rust 原生合并器可用性与 SyncTeX 字节一致测试。"""
+
+    def test_table_counter_ignored_for_table_free_chunk(self):
+        c1 = {'text': '\\section{无表节}纯文字', 'counters': {'section': 1, 'table': 2, 'figure': 3},
+              'marks': {'section_next': True}}
+        c2 = dict(c1, counters={'section': 1, 'table': 1, 'figure': 0})
+        self.assertEqual(fastpath._chunk_hash('pre', c1), fastpath._chunk_hash('pre', c2))
+
+        ct1 = {'text': '\\section{有表节}\\begin{table}a\\end{table}',
+               'counters': {'section': 1, 'table': 2}}
+        ct2 = dict(ct1, counters={'section': 1, 'table': 1})
+        self.assertNotEqual(fastpath._chunk_hash('pre', ct1), fastpath._chunk_hash('pre', ct2))
+
+    def test_subsection_counter_reset_when_starting_with_section(self):
+        c1 = {'text': '\\section{新节}\\subsection{子节}',
+              'counters': {'section': 1, 'subsection': 3},
+              'marks': {'section_next': True}}
+        c2 = dict(c1, counters={'section': 1, 'subsection': 5})
+        self.assertEqual(fastpath._chunk_hash('pre', c1), fastpath._chunk_hash('pre', c2))
+
+        sub1 = {'text': '\\subsection{续子节}正文',
+                'counters': {'section': 1, 'subsection': 3},
+                'marks': {'section_next': False}}
+        sub2 = dict(sub1, counters={'section': 1, 'subsection': 4})
+        self.assertNotEqual(fastpath._chunk_hash('pre', sub1), fastpath._chunk_hash('pre', sub2))
+
+    def test_theorem_counters_filtered_when_absent_and_kept_when_used(self):
+        no_thm1 = {'text': '纯正文', 'counters': {'theorem': 2, 'lemma': 1}}
+        no_thm2 = {'text': '纯正文', 'counters': {'theorem': 5, 'lemma': 0}}
+        self.assertEqual(fastpath._chunk_hash('pre', no_thm1), fastpath._chunk_hash('pre', no_thm2))
+
+        thm1 = {'text': '\\begin{lemma}引理\\end{lemma}', 'counters': {'theorem': 2, 'lemma': 1}}
+        thm2 = {'text': '\\begin{lemma}引理\\end{lemma}', 'counters': {'theorem': 3, 'lemma': 1}}
+        self.assertNotEqual(fastpath._chunk_hash('pre', thm1), fastpath._chunk_hash('pre', thm2))
+
+    def test_native_synctex_matches_python_byte_for_byte(self):
+        exe = pdf_stamp.find_native_merger()
+        if not exe:
+            self.skipTest('floria_merge binary not built')
+        import gzip
+        with tempfile.TemporaryDirectory() as td:
+            s1 = os.path.join(td, 'a.slim')
+            s2 = os.path.join(td, 'b.slim')
+            with open(s1, 'w', encoding='utf-8') as f:
+                f.write('H Magnification:1000\nH Unit:1\nH X Offset:0\nH Y Offset:0\n'
+                        'PAGES 2\n{1\n[1,10:100,200:300,400,0\n}1\n{2\n}2\nFLORIA_SLIM_END\n')
+            with open(s2, 'w', encoding='utf-8') as f:
+                f.write('H Magnification:1000\nH Unit:1\nH X Offset:0\nH Y Offset:0\n'
+                        'PAGES 1\n{1\nh1,5:50,60:70,80,0\n}1\nFLORIA_SLIM_END\n')
+            items = [
+                {'slim': s1, 'offset': 0, 'chunk_line': 1},
+                {'slim': s2, 'offset': 2, 'chunk_line': 50},
+            ]
+            out_py = os.path.join(td, 'py.synctex.gz')
+            out_rs = os.path.join(td, 'rs.synctex.gz')
+            fastpath._merge_synctex_fast(items, out_py)
+            res = pdf_stamp.run_native_merge(synctex_args=(items, out_rs))
+            self.assertIsNotNone(res)
+            self.assertTrue(res['ok'])
+            with gzip.open(out_py, 'rb') as fp, gzip.open(out_rs, 'rb') as fr:
+                self.assertEqual(fp.read(), fr.read())
+
+
 if __name__ == '__main__':
     unittest.main()

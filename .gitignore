@@ -9,3 +9,6 @@ pdf/backend/**/__pycache__/
 
 # 网关托管后端自动写的运行日志（路径由宿主固定在预览根，不可配置）
 backend.log
+
+# Rust 原生合并器的编译中间产物（源码与 native/bin/ 预编译产物入库）
+pdf/backend/native/floria_merge/target/

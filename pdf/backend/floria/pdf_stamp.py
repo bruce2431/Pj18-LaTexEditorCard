@@ -763,6 +763,141 @@ def shift_newlabel_line(line, delta):
 
 
 # ---------- 核心：PDF 合并 + 原位盖印 + /FTOC & /FPR 热更新 ----------
+_NATIVE_CACHE = {}
+
+
+def find_native_merger():
+    """定位便携 Rust 原生合并器 floria_merge(.exe)；设置 FLORIA_NO_NATIVE=1 可强制回退 Python。"""
+    if os.environ.get('FLORIA_NO_NATIVE'):
+        return None
+    if 'bin' in _NATIVE_CACHE:
+        p = _NATIVE_CACHE['bin']
+        if p and os.path.isfile(p):
+            return p
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    exe_name = 'floria_merge.exe' if os.name == 'nt' else 'floria_merge'
+    candidates = (
+        os.path.join(backend_dir, 'native', 'bin', exe_name),
+        os.path.join(backend_dir, 'native', 'floria_merge', 'target', 'release', exe_name),
+    )
+    for cand in candidates:
+        if os.path.isfile(cand):
+            _NATIVE_CACHE['bin'] = cand
+            return cand
+    _NATIVE_CACHE['bin'] = None
+    return None
+
+
+def _ser_fmeta(fm):
+    if not fm:
+        return None
+    ftoc = fm.get('ftoc_pages')
+    fpr = fm.get('fpr_pages')
+    return {
+        'pages': [list(p) for p in fm.get('pages') or ()],
+        'has_atlas': bool(fm.get('has_atlas', False)),
+        'ftoc_pages': sorted(ftoc) if ftoc is not None else None,
+        'fpr_pages': sorted(fpr) if fpr is not None else None,
+    }
+
+
+def _build_pdf_spec(parts, out, kit_info, outline, toc_pages, label_pages):
+    ser_parts = []
+    for item in parts:
+        if item[0] == 'blanks':
+            _, cnt, (bw, bh) = item
+            ser_parts.append({
+                'kind': 'blanks',
+                'count': int(cnt),
+                'width': float(bw),
+                'height': float(bh),
+            })
+        else:
+            _, path, a, b, abs_start, fmeta = item
+            ser_parts.append({
+                'kind': 'pages',
+                'path': path,
+                'start_idx': int(a),
+                'end_idx': int(b),
+                'abs_start': int(abs_start),
+                'fmeta': _ser_fmeta(fmeta),
+            })
+    return {
+        'out': out,
+        'kit_pdf': kit_info['pdf'],
+        'kit_info': {
+            'twoside': bool(kit_info.get('twoside', True)),
+            'plain_cx': float(kit_info['plain_cx']),
+            'plain_y': float(kit_info['plain_y']),
+            'even_pg_x': float(kit_info['even_pg_x']),
+            'even_mk_rx': float(kit_info['even_mk_rx']),
+            'odd_mk_lx': float(kit_info['odd_mk_lx']),
+            'odd_pg_rx': float(kit_info['odd_pg_rx']),
+            'head_y': float(kit_info['head_y']),
+            'fonts': kit_info['fonts'],
+        },
+        'parts': ser_parts,
+        'outline': [
+            {'level': e.get('level') or '', 'title': e.get('title') or '',
+             'page': int(e.get('page') or 0)}
+            for e in (outline or ())
+        ],
+        'toc_pages': [str(p) for p in (toc_pages or ())],
+        'label_pages': {str(k): str(v) for k, v in (label_pages or {}).items()},
+    }
+
+
+def run_native_merge(pdf_args=None, synctex_args=None, timeout=120):
+    """调用 Rust 原生合并器并发完成 PDF 盖印合并与 SyncTeX 合并。
+
+    成功返回结果字典 `{ok, total_pages, pdf_ms, synctex_ms, total_ms}`；
+    无可用二进制或执行异常时返回 None，由调用方自动回退纯 Python 路径。
+    """
+    exe = find_native_merger()
+    if not exe:
+        return None
+    spec = {}
+    if pdf_args is not None:
+        spec['pdf'] = _build_pdf_spec(*pdf_args)
+    if synctex_args is not None:
+        items, sync_out = synctex_args
+        if not items or not all(it.get('slim') for it in items):
+            return None
+        spec['synctex'] = {
+            'out': sync_out,
+            'items': [
+                {
+                    'slim': it['slim'],
+                    'offset': int(it.get('offset') or 0),
+                    'chunk_line': int(it.get('chunk_line') or 1),
+                }
+                for it in items
+            ],
+        }
+    if not spec:
+        return None
+    payload = json.dumps(spec, ensure_ascii=False).encode('utf-8')
+    try:
+        proc = subprocess.run(
+            [exe, '-'],
+            input=payload,
+            capture_output=True,
+            timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        res = json.loads(proc.stdout.decode('utf-8', errors='replace'))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(res, dict) or not res.get('ok'):
+        return None
+    return res
+
+
 def _encode_digits(s, fspec):
     cids = fspec['cids']
     parts = []
@@ -784,6 +919,12 @@ def stamp_and_merge_pdfs(parts, out, kit_info, outline=None,
       - ('blanks', n, (w, h))
       - ('pages', path, start_idx, end_idx, abs_start_page, fmeta_dict_or_None)
     """
+    native_res = run_native_merge(
+        pdf_args=(parts, out, kit_info, outline, toc_pages, label_pages)
+    )
+    if native_res is not None:
+        return int(native_res.get('total_pages') or 0)
+
     import pypdf
     from pypdf.generic import (
         ArrayObject, DecodedStreamObject, DictionaryObject, FloatObject,
