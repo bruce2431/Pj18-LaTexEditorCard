@@ -10,7 +10,7 @@ import os
 import tempfile
 import unittest
 
-from floria import fastpath
+from floria import fastpath, pdf_stamp, tikz_cache
 
 PREAMBLE = r'\documentclass[UTF8]{ctexbook}'
 
@@ -185,6 +185,39 @@ class NewpageSplitTest(unittest.TestCase):
                             fastpath._chunk_hash('pre', d))
 
 
+class XrefSigTest(unittest.TestCase):
+    """分片缓存必须跟着「所引标签在聚合 aux 里的定义」失效，否则链接指向旧锚点。"""
+
+    def test_no_refs_gives_none(self):
+        self.assertIsNone(fastpath._xref_sig('正文没有引用', {}))
+
+    def test_label_page_change_does_not_invalidate_sig(self):
+        # 解耦模式下 \pageref 由合并阶段 /FPR 原位热更新，仅页码漂移不应让引用块失效
+        text = '见第\\pageref{sec:a}节'
+        a = {'sec:a': '\\newlabel{sec:a}{{1.1}{8}{甲}{subsection.1.1}{}}'}
+        b = {'sec:a': '\\newlabel{sec:a}{{1.1}{9}{甲}{subsection.1.1}{}}'}
+        self.assertEqual(fastpath._xref_sig(text, a),
+                         fastpath._xref_sig(text, b))
+
+    def test_label_number_change_changes_sig(self):
+        text = '见第\\ref{sec:a}节'
+        a = {'sec:a': '\\newlabel{sec:a}{{1.1}{8}{甲}{subsection.1.1}{}}'}
+        b = {'sec:a': '\\newlabel{sec:a}{{1.2}{8}{甲}{subsection.1.1}{}}'}
+        self.assertNotEqual(fastpath._xref_sig(text, a),
+                            fastpath._xref_sig(text, b))
+
+    def test_label_anchor_change_changes_sig(self):
+        text = '\\ref{sec:a}'
+        a = {'sec:a': '\\newlabel{sec:a}{{1.1}{8}{甲}{subsubsection*.30}{}}'}
+        b = {'sec:a': '\\newlabel{sec:a}{{1.1}{8}{甲}{subsection.1.1}{}}'}
+        self.assertNotEqual(fastpath._xref_sig(text, a),
+                            fastpath._xref_sig(text, b))
+
+    def test_missing_label_still_has_sig(self):
+        # 未定义标签的签名不能是 None（None 表示「无引用」，会让旧块蒙混过关）
+        self.assertIsNotNone(fastpath._xref_sig('\\ref{sec:x}', {}))
+
+
 class TocParseTest(unittest.TestCase):
     """分块编出的 wrapper.toc 决定书签树：绝对页码 + 层级嵌套。"""
 
@@ -265,6 +298,109 @@ class ResultShapeTest(unittest.TestCase):
         r = fastpath._fail('merge_pdf_failed', '拼 PDF 失败')
         self.assertEqual(r['status'], fastpath.STATUS_FAILED)
         self.assertEqual(r['reason_code'], 'merge_pdf_failed')
+
+
+class PdfStampTest(unittest.TestCase):
+    """页码解耦判定、导言区按需精简、TOC/aux 页码平移与 fmeta 解析。"""
+
+    def test_can_decouple_supported_and_guards(self):
+        self.assertTrue(pdf_stamp.can_decouple(
+            r'\documentclass[UTF8]{ctexbook}\usepackage{amsmath}', '', [{'text': '正文'}]))
+        self.assertFalse(pdf_stamp.can_decouple(
+            r'\documentclass{ctexbook}\usepackage{fancyhdr}', '', [{'text': '正文'}]))
+        self.assertFalse(pdf_stamp.can_decouple(
+            r'\documentclass{ctexbook}', r'\frontmatter', [{'text': '正文'}]))
+        self.assertTrue(pdf_stamp.can_decouple(
+            r'\documentclass{ctexbook}', '% \\frontmatter\n', [{'text': '正文'}]))
+
+    def test_strip_preamble_removes_unused_heavy_pkgs(self):
+        pre = (
+            '\\documentclass{ctexbook}\n'
+            '\\usepackage{tikz}\n'
+            '\\usetikzlibrary{arrows}\n'
+            '\\usepackage{chemfig}\n'
+            '\\setchemfig{atom sep=1.5em}\n'
+            '\\usepackage{mhchem}\n'
+            '\\usepackage{booktabs,float}\n'
+            '\\usepackage{amsmath}\n'
+        )
+        s_plain = pdf_stamp.strip_preamble(pre, '纯正文段落')
+        for tok in ('tikz', 'chemfig', 'mhchem', 'booktabs', 'float'):
+            self.assertNotIn(tok, s_plain)
+        self.assertIn('amsmath', s_plain)
+
+        s_chem = pdf_stamp.strip_preamble(pre, r'\chemfig{H-O-H} \ce{H2O}')
+        self.assertIn('chemfig', s_chem)
+        self.assertIn('tikz', s_chem)
+        self.assertIn('mhchem', s_chem)
+        self.assertNotIn('booktabs', s_chem)
+
+    def test_shift_toc_and_prepare_for_front(self):
+        toc = (
+            '\\contentsline {chapter}{\\numberline {一}甲}{3}{chapter.1}%\n'
+            '\\contentsline {section}{\\numberline {1.1}乙}{5}{section.1.1}%\n'
+        )
+        shifted = pdf_stamp.shift_toc_pages(toc, 4)
+        self.assertIn('{7}{chapter.1}', shifted)
+        self.assertIn('{9}{section.1.1}', shifted)
+
+        struct_t, wrap_t, pages = pdf_stamp.prepare_toc_for_front(shifted)
+        self.assertEqual(pages, ['7', '9'])
+        self.assertIn('{*}{chapter.1}', struct_t)
+        self.assertIn(r'{\FloriaTocPg{0}{7}}', wrap_t)
+        self.assertIn(r'{\FloriaTocPg{1}{9}}', wrap_t)
+
+        # 页码再变但结构不变时，struct_text 必须完全相同（front 零重编保证）
+        struct_t2, _, pages2 = pdf_stamp.prepare_toc_for_front(
+            pdf_stamp.shift_toc_pages(toc, 10))
+        self.assertEqual(struct_t, struct_t2)
+        self.assertEqual(pages2, ['13', '15'])
+
+    def test_shift_newlabel_line(self):
+        ln = r'\newlabel{纯溶液和固体}{{1.2}{3}{标题}{section.1.2}{}}'
+        name, shifted, pg = pdf_stamp.shift_newlabel_line(ln, 6)
+        self.assertEqual(name, '纯溶液和固体')
+        self.assertEqual(pg, '9')
+        self.assertIn('{{1.2}{9}{标题}', shifted)
+
+    def test_parse_fmeta_with_patch_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, 'wrapper.fmeta')
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(
+                    'P 1 plain 1 -1\n'
+                    'P 2 headings 1 2\n'
+                    'BODY_PAGES 2\n'
+                    'HAS_ATLAS 1\n'
+                    'PATCH 0|1\n'
+                )
+            fm = pdf_stamp.parse_fmeta(p)
+            self.assertEqual(fm['body_pages'], 2)
+            self.assertTrue(fm['has_atlas'])
+            self.assertEqual(fm['ftoc_pages'], {0})
+            self.assertEqual(fm['fpr_pages'], {1})
+
+
+class TikzCacheTest(unittest.TestCase):
+    """TikZ 图元扫描：过滤上下文依赖、跳过注释/嵌套、捕获局部 \\setchemfig。"""
+
+    def test_find_cacheable_pictures_filters_and_captures(self):
+        blocks = [
+            '\\setchemfig{atom sep=1.8em}\n',
+            '\\begin{tikzpicture}\\draw (0,0)--(1,0);\\end{tikzpicture}\n',
+            '\\begin{tikzpicture}\\node{\\chemfig{A-B}};\\end{tikzpicture}\n',
+            '\\begin{tikzpicture}[remember picture]\\draw (0,0)--(1,1);\\end{tikzpicture}\n',
+            '% \\begin{tikzpicture}\\draw (0,0)--(2,0);\\end{tikzpicture}\n',
+            '\\begin{tikzpicture}\\draw (0,0)--(0,1);\\end{tikzpicture}\n',
+            '\\begin{tikzpicture}\\draw (0,0)--(1,1);\\end{tikzpicture}\n',
+            '\\begin{tikzpicture}\\node{\\ref{fig:1}};\\end{tikzpicture}\n',
+        ]
+        spans = tikz_cache.find_cacheable_pictures(''.join(blocks))
+        self.assertEqual(len(spans), 4)
+        # 第 2 个含 \chemfig，应自动捕获前置 \setchemfig
+        self.assertEqual(spans[1][3], r'\setchemfig{atom sep=1.8em}')
+        # 不含 \chemfig 的普通 tikzpicture 不携带 \setchemfig
+        self.assertEqual(spans[0][3], '')
 
 
 if __name__ == '__main__':

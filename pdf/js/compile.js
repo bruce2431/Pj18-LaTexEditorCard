@@ -157,6 +157,11 @@
     if (S.busy || !S.book) return;
     S.busy = true;
     setState('busy');
+    // 新一轮编译开始：先撤掉上一轮在原文里打的报错标红（日志卡可能不在场，故由发起编译的这里清）。
+    F.bridge.emit('src-mark', {
+      path: S.book + '/' + (S.texName || 'main.tex'),
+      marks: [],
+    });
     const myId = ++tryId;
     startPoll(myId);
     let r;

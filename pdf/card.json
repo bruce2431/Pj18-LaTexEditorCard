@@ -2,5 +2,6 @@
   "title": "PDF",
   "entry": "index.html",
   "order": 10,
-  "default": true
+  "default": true,
+  "repo": "https://github.com/bruce2431/Pj18-LaTexEditorCard"
 }
