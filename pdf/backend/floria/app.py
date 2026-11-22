@@ -6,7 +6,7 @@ import threading
 import webbrowser
 from http.server import ThreadingHTTPServer
 
-from . import config, doctor, log
+from . import compiler, config, doctor, log
 from .http_api import COMPILER, Handler
 
 
@@ -22,6 +22,15 @@ def _self_check_async(book=None):
         except Exception as ex:                 # noqa: BLE001
             log.exception('启动自检', ex)
     threading.Thread(target=run, daemon=True, name='floria-selfcheck').start()
+
+
+def _warmup_async():
+    def run():
+        try:
+            compiler.warmup(state=COMPILER.state)
+        except Exception as ex:                 # noqa: BLE001
+            log.exception('启动预热', ex)
+    threading.Thread(target=run, daemon=True, name='floria-warmup').start()
 
 
 def run(port=8765, root=None, no_open=False, auto_restart=False):
@@ -52,6 +61,7 @@ def run(port=8765, root=None, no_open=False, auto_restart=False):
         wd = Watchdog(COMPILER.state)
         wd.start()
     _self_check_async()
+    _warmup_async()
     if not no_open:
         threading.Timer(0.6, webbrowser.open, [url]).start()
     try:

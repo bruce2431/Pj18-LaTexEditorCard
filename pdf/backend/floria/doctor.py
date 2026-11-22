@@ -7,7 +7,7 @@
 import os
 import time
 
-from . import BUILD_ID, books, config, fastpath, source_fingerprint, synctex, toolchain
+from . import BUILD_ID, books, config, fastpath, pdf_stamp, source_fingerprint, synctex, toolchain
 
 
 def _check(cid, status, detail, hint='', ms=None):
@@ -119,9 +119,21 @@ def _fingerprint():
                   '重启后端或等 --auto-restart 生效' if stale else '')
 
 
+def _native_check():
+    exe = pdf_stamp.find_native_merger()
+    if not exe:
+        return _check('native.floria_merge', 'warn', '未找到便携原生引擎（回退纯 Python）',
+                      '检查 pdf/backend/native/bin/floria_merge.exe')
+    try:
+        sz = os.path.getsize(exe) / 1024.0 / 1024.0
+    except OSError:
+        sz = 0.0
+    return _check('native.floria_merge', 'ok', 'floria_merge.exe (%.1f MB)' % sz)
+
+
 def run_checks(book=None, refresh=False):
     t0 = time.time()
-    checks = [_import_check()]
+    checks = [_import_check(), _native_check()]
     for name in ('xelatex', 'xdvipdfmx'):
         c, _exe = _tool(name)
         checks.append(c)

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""快速路径的文档结构判定：单章 / 无章 / 双章 / appendix / part / 误判防护。
+r"""快速路径的文档结构判定：单章 / 无章 / 双章 / appendix / part / 误判防护。
 
 2026-10-27 起整本 latexmk 兜底已删除：单章、无章、含 \part 的书稿都按块编译，
 只有 \appendix（章编号改字母并重置计数器）仍然不能按章拼接。
@@ -48,7 +48,7 @@ class SplitModesTest(unittest.TestCase):
         self.assertEqual(doc['front'].strip(), '')
 
     def test_no_chapter(self):
-        """无 \chapter 的短稿整篇正文一块。"""
+        r"""无 \chapter 的短稿整篇正文一块。"""
         doc, code = self.split(r'\section{引言}\n正文')
         self.assertIsNone(code)
         self.assertEqual(len(doc['chunks']), 1)
@@ -73,7 +73,7 @@ class SplitModesTest(unittest.TestCase):
         self.assertEqual(code, 'has_appendix')
 
     def test_part_is_a_block_boundary(self):
-        """\part 自成一块（导出 part 计数），不与后一章挤在一起。"""
+        r"""\part 自成一块（导出 part 计数），不与后一章挤在一起。"""
         doc, code = self.split(r'\chapter{甲}\n甲\n\part{下卷}\n\chapter{乙}\n乙')
         self.assertIsNone(code)
         self.assertEqual(len(doc['chunks']), 3)
@@ -216,6 +216,15 @@ class XrefSigTest(unittest.TestCase):
     def test_missing_label_still_has_sig(self):
         # 未定义标签的签名不能是 None（None 表示「无引用」，会让旧块蒙混过关）
         self.assertIsNotNone(fastpath._xref_sig('\\ref{sec:x}', {}))
+
+    def test_intra_chunk_label_excluded_by_default(self):
+        text = '\\label{tab:own}见表\\ref{tab:own}'
+        a = {'tab:own': '\\newlabel{tab:own}{{1.3}{8}{表}{table.1.3}{}}'}
+        b = {'tab:own': '\\newlabel{tab:own}{{1.4}{8}{表}{table.1.4}{}}'}
+        self.assertIsNone(fastpath._xref_sig(text, a))
+        self.assertEqual(fastpath._xref_sig(text, a), fastpath._xref_sig(text, b))
+        self.assertNotEqual(fastpath._xref_sig(text, a, include_own=True),
+                            fastpath._xref_sig(text, b, include_own=True))
 
 
 class TocParseTest(unittest.TestCase):
@@ -403,6 +412,26 @@ class TikzCacheTest(unittest.TestCase):
         self.assertEqual(spans[0][3], '')
 
 
+    def test_standalone_chemfig_and_scheme_with_scoped_setchemfig(self):
+        body = '\n'.join([
+            r'\setchemfig{atom sep=2em}',
+            r'\chemfig{A-B}',
+            r'{\setchemfig{bond offset=1pt}\chemfig[scale=0.8]{C=D}}',
+            r'\schemestart \chemfig{E} \arrow{->} \chemfig{F} \schemestop',
+            r'\chemfig{@{a}X-@{b}Y}\chemmove{\draw (a)--(b);}',
+            r'\chemfig*{G-H}',
+        ])
+        spans = tikz_cache.find_cacheable_pictures(body)
+        self.assertEqual(len(spans), 4)
+        self.assertEqual(spans[0][3], r'\setchemfig{atom sep=2em}')
+        self.assertEqual(
+            spans[1][3],
+            r'\setchemfig{atom sep=2em}\setchemfig{bond offset=1pt}',
+        )
+        self.assertTrue(spans[2][2].startswith(r'\schemestart'))
+        self.assertEqual(spans[3][3], r'\setchemfig{atom sep=2em}')
+
+
 class CounterFilterAndNativeTest(unittest.TestCase):
     """块计数器按需过滤哈希 + Rust 原生合并器可用性与 SyncTeX 字节一致测试。"""
 
@@ -465,6 +494,56 @@ class CounterFilterAndNativeTest(unittest.TestCase):
             self.assertTrue(res['ok'])
             with gzip.open(out_py, 'rb') as fp, gzip.open(out_rs, 'rb') as fr:
                 self.assertEqual(fp.read(), fr.read())
+
+
+    def test_native_prep_scans_images_and_shifts_aux(self):
+        if not pdf_stamp.find_native_merger():
+            self.skipTest('floria_merge binary not built')
+        import struct
+        with tempfile.TemporaryDirectory() as td:
+            img_dir = os.path.join(td, 'image')
+            os.makedirs(img_dir)
+            # Minimal valid PNG header (200x100 px @ default 72 DPI => 200x100 bp)
+            png_hdr = (
+                b'\x89PNG\r\n\x1a\n'
+                + struct.pack('>I4sII', 13, b'IHDR', 200, 100)
+                + b'\x08\x02\x00\x00\x00\x00\x00\x00\x00'
+            )
+            with open(os.path.join(img_dir, 'sample.png'), 'wb') as f:
+                f.write(png_hdr)
+            out_ch1 = os.path.join(td, '.build', 'floria', 'out', 'ch1')
+            os.makedirs(out_ch1)
+            with open(os.path.join(out_ch1, 'wrapper.aux'), 'w', encoding='utf-8') as f:
+                f.write('\\newlabel{eq:one}{{1.1}{3}{标题}{equation.1.1}{}}\n')
+            res = pdf_stamp.run_native_prep(
+                td, chunk_ids=['ch1'], deltas={'ch1': 10}, include_front=False,
+                write_agg_aux=True, scan_images=True, upgrade_tikz_dp=False,
+            )
+            self.assertIsNotNone(res)
+            self.assertTrue(res.get('ok'))
+            self.assertEqual(res['label_pages'].get('eq:one'), '13')
+            self.assertIn('sample.png', res['images'])
+            w_pt, h_pt, is_pdf = res['images']['sample.png']
+            self.assertAlmostEqual(w_pt, 200.0 * 72.27 / 72.0, places=2)
+            self.assertAlmostEqual(h_pt, 100.0 * 72.27 / 72.0, places=2)
+            self.assertEqual(is_pdf, 0.0)
+
+    def test_should_retry_with_full_preamble_fast_fails_syntax(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(fastpath._should_retry_with_full_preamble(
+                '! Undefined control sequence.\nl.42 \\UndefinedUserMacroXYZ\n', td))
+            self.assertFalse(fastpath._should_retry_with_full_preamble(
+                '! Missing $ inserted.\n', td))
+            self.assertFalse(fastpath._should_retry_with_full_preamble(
+                '! LaTeX Error: \\begin{center} on input line 5 ended by \\end{document}.\n', td))
+            self.assertTrue(fastpath._should_retry_with_full_preamble(
+                '! Undefined control sequence.\nl.12 \\toprule\n', td))
+            self.assertTrue(fastpath._should_retry_with_full_preamble(
+                '! Undefined control sequence.\n<argument> >{\\centering \\arraybackslash\n', td))
+        pre = '\\usepackage{tikz}\n\\usepackage{tabularx}\n'
+        kept = pdf_stamp.strip_preamble(pre, '\\begin{tabular}{>{\\centering\\arraybackslash}m{3cm}}a\\end{tabular}')
+        self.assertIn('tabularx', kept)
+        self.assertNotIn('tikz', kept)
 
 
 if __name__ == '__main__':

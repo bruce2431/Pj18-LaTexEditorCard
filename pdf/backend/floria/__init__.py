@@ -6,8 +6,14 @@
 """
 import hashlib
 import os
+import sys
 
-__version__ = '1.0.0'
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_VENDOR_DIR = os.path.join(_BACKEND_ROOT, 'vendor')
+if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
+    sys.path.insert(0, _VENDOR_DIR)
+
+__version__ = '1.0.1'
 
 
 def source_fingerprint():
@@ -18,7 +24,7 @@ def source_fingerprint():
     for cur, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in ('runtime', 'vendor', 'tex', '__pycache__')]
         for n in sorted(names):
-            if not n.endswith('.py'):
+            if not (n.endswith('.py') or n == 'floria_merge.exe'):
                 continue
             p = os.path.join(cur, n)
             try:

@@ -156,3 +156,92 @@ def _ledger(name, ok, elapsed, by, mode, reason=None, reason_code=None, phases=N
         'phases': phases, 'chunks': chunks,
         'error': error or '', 'log': log or '',
     })
+
+
+def warmup(state=None, root=None):
+    """启动预热：将便携 xelatex/xdvipdfmx/fmt/CJK 字体加载进系统页缓存，并预热各书稿图元与尺寸缓存。
+
+    不抢占书稿 `.compile.lock`；若检测到用户正在编译则主动礼让，绝不阻塞真实请求。
+    """
+    import subprocess
+    import tempfile
+    from . import pdf_stamp, tikz_cache
+
+    def _yield_if_busy():
+        while state is not None and state.snapshot().get('state') != 'idle':
+            time.sleep(0.4)
+
+    t0 = time.time()
+    tex = toolchain.find_tex_tool('xelatex') or shutil.which('xelatex')
+    if not tex:
+        return {'ok': False, 'reason': 'no_xelatex'}
+    xdv = toolchain.find_tex_tool('xdvipdfmx') or shutil.which('xdvipdfmx') or ''
+    env = toolchain.sanitized_env()
+    pdf_stamp.find_native_merger()
+
+    # 1) 极小 CJK + 数学页预热：把 xelatex.exe / MiKTeX DLL / xelatex.fmt / 字体映射预读进 OS 缓存
+    _yield_if_busy()
+    try:
+        with tempfile.TemporaryDirectory(prefix='floria_warm_') as td:
+            wtex = os.path.join(td, 'warm.tex')
+            with open(wtex, 'w', encoding='utf-8') as f:
+                f.write('\\documentclass[UTF8]{ctexbook}\n\\usepackage{amsmath,amssymb}\n'
+                        '\\begin{document}\n预热$x_1+y_2$\n\\end{document}\n')
+            cmd = [tex]
+            if 'miktex' in tex.lower():
+                cmd.append('--disable-installer')
+            cmd += ['-interaction=nonstopmode', '-halt-on-error', '-no-pdf', 'warm.tex']
+            subprocess.run(cmd, cwd=td, env=env, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=25)
+            wxdv = os.path.join(td, 'warm.xdv')
+            if xdv and os.path.isfile(wxdv):
+                subprocess.run([xdv, '-q', '-E', '-z', '1', '-o', 'warm.pdf', 'warm.xdv'],
+                               cwd=td, env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=15)
+    except Exception as ex:                     # noqa: BLE001
+        log.warn('工具链页缓存预热跳过：%s' % ex)
+
+    # 2) 各书稿配图尺寸、解耦套件与 TikZ/chemfig 图元缓存预热
+    books_root = root or config.BOOKS_ROOT
+    warmed_books = 0
+    built_diagrams = 0
+    if books_root and os.path.isdir(books_root):
+        for entry in sorted(os.listdir(books_root)):
+            if entry.startswith('.'):
+                continue
+            bdir = os.path.join(books_root, entry)
+            if not os.path.isfile(os.path.join(bdir, 'main.tex')):
+                continue
+            _yield_if_busy()
+            if os.path.exists(os.path.join(bdir, '.build', '.compile.lock')):
+                continue
+            try:
+                doc, _ = fastpath._split_document(bdir)
+                if not doc:
+                    continue
+                pdf_stamp.run_native_prep(
+                    bdir,
+                    chunk_ids=[c['id'] for c in doc['chunks']],
+                    write_agg_aux=False,
+                    scan_images=True,
+                    upgrade_tikz_dp=True,
+                )
+                if pdf_stamp.can_decouple(doc['preamble'], doc['front'], doc['chunks']):
+                    pdf_stamp.ensure_kit(bdir, doc['preamble'], env, tex, tex, xdv)
+                for ch in doc['chunks']:
+                    _yield_if_busy()
+                    if os.path.exists(os.path.join(bdir, '.build', '.compile.lock')):
+                        break
+                    _, st = tikz_cache.preprocess_chunk_tikz(
+                        bdir, doc['preamble'], ch['text'], env, tex, tex, xdv
+                    )
+                    built_diagrams += st.get('built', 0)
+                warmed_books += 1
+            except Exception as ex:             # noqa: BLE001
+                log.warn('书稿预热跳过(%s)：%s' % (entry, ex))
+
+    dt = round(time.time() - t0, 2)
+    log.info('启动预热完成：%.2fs（书稿 %d 本，新建图元 %d 个）'
+             % (dt, warmed_books, built_diagrams))
+    return {'ok': True, 'elapsed': dt, 'books': warmed_books, 'built_diagrams': built_diagrams}
+

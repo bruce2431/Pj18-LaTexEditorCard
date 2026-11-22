@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Floria LaTeX</title>
-<link rel="stylesheet" href="css/app.css?v=1.0.0">
+<link rel="stylesheet" href="css/app.css?v=1.0.2">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23111111'/><text x='50' y='68' font-size='52' text-anchor='middle' font-family='Georgia' fill='white'>F</text></svg>">
 </head>
 <body>
@@ -30,6 +30,25 @@
         <path d="M6 4h7.5M6 8h7.5M6 12h7.5M2.5 4h.01M2.5 8h.01M2.5 12h.01"/>
       </svg>
     </button>
+    <div class="v-annotwrap">
+      <button class="vt-icon" id="annot-toggle" title="标记（高亮笔）">
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10.6 2.4 13.6 5.4 6.2 12.8 2.6 13.4 3.2 9.8z"/>
+          <path d="M9 4l3 3"/>
+        </svg>
+      </button>
+      <div id="annot-panel" class="hidden">
+        <div class="ap-title">颜色</div>
+        <div class="ap-colors">
+          <button class="ap-color on" data-color="#FFD84D" style="--c:#FFD84D" title="黄"></button>
+          <button class="ap-color" data-color="#6FD46F" style="--c:#6FD46F" title="绿"></button>
+          <button class="ap-color" data-color="#6FD3E8" style="--c:#6FD3E8" title="青"></button>
+          <button class="ap-color" data-color="#F58FC4" style="--c:#F58FC4" title="粉"></button>
+          <button class="ap-color" data-color="#F25C54" style="--c:#F25C54" title="红"></button>
+        </div>
+        <button class="ap-clear" id="annot-clear">清除全部标记</button>
+      </div>
+    </div>
     <div class="vt-right">
       <button class="vt-btn primary" id="v-compile" title="本机重新编译这篇论文">编译</button>
       <div class="v-zoomwrap">
@@ -100,14 +119,14 @@
 <div id="toast" class="hidden"></div>
 
 <script src="lib/pdfjs/pdf.min.js"></script>
-<script src="js/pdfview.js?v=1.0.0"></script>
+<script src="js/pdfview.js?v=1.0.2"></script>
 <script src="js/util.js?v=1.0.0"></script>
 <script src="js/bridge.js?v=1.0.0"></script>
 <script src="js/state.js?v=1.0.0"></script>
 <script src="js/toolbar.js?v=1.0.0"></script>
 <script src="js/compile.js?v=1.0.0"></script>
 <script src="js/toc.js?v=1.0.0"></script>
-<script src="js/viewer.js?v=1.0.0"></script>
+<script src="js/viewer.js?v=1.0.1"></script>
 <script src="js/start.js?v=1.0.0"></script>
 </body>
 </html>

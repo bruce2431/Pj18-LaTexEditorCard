@@ -8,15 +8,15 @@
   'use strict';
   const F = window.Floria;
 
-  function route() {
+  function route(initial) {
     const m = /^#\/p\/(.+)$/.exec(location.hash || '');
     if (m) F.viewer.open(decodeURIComponent(m[1]));
-    else F.viewer.close();
+    else if (!initial || !F.bridge.embedded()) F.viewer.close();
   }
 
   F.viewer.init();
 
-  window.addEventListener('hashchange', route);
-  route();
+  window.addEventListener('hashchange', () => route(false));
+  route(true);
   F.viewer.preload();     // 未桥接：挑一篇顶上（桥接时是 no-op，等宿主的广播/命令）
 })();

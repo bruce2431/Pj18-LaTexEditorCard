@@ -23,6 +23,37 @@ def lock_path(book_dir, job='main'):
     return os.path.join(book_dir, '.build', '.' + job + '.lock')
 
 
+def _pid_alive(pid):
+    """检测锁内记录的进程是否仍存活（同机跨进程崩溃后无需干等 900s）。"""
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    if pid == os.getpid():
+        return True
+    if os.name == 'nt':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return ctypes.get_last_error() == 5       # ACCESS_DENIED => 仍存活
+            try:
+                code = ctypes.c_ulong(0)
+                if not kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return True
+                return code.value == 259                  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(h)
+        except Exception:                                 # noqa: BLE001
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
 def read_lock(path):
     """读锁内容：返回 dict（兼容纯 pid 文本）；读不到返回 None。"""
     try:
@@ -76,12 +107,14 @@ class BuildLock:
         while True:
             if self._try_create():
                 return self
-            # 残锁：进程被杀留下的锁，超过 LOCK_STALE 秒强行接管
+            # 残锁：进程已退出或超过 LOCK_STALE 秒强行接管
             try:
                 age = time.time() - os.path.getmtime(self.path)
             except OSError:
                 continue                     # 锁刚被释放，立刻重试
-            if age > config.LOCK_STALE:
+            cur = read_lock(self.path) if age > 0.5 else None
+            dead = bool(cur and isinstance(cur.get('pid'), int) and not _pid_alive(cur['pid']))
+            if dead or age > config.LOCK_STALE:
                 try:
                     os.unlink(self.path)
                 except OSError:

@@ -1,4 +1,7 @@
 mod pdf;
+mod postchunk;
+mod prep;
+mod runner;
 mod synctex;
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +30,7 @@ struct JobResult {
     error: Option<String>,
 }
 
-fn run_job(raw: &[u8]) -> Result<JobResult, String> {
+fn run_merge_job(raw: &[u8]) -> Result<JobResult, String> {
     let t0 = Instant::now();
     let spec: JobSpec =
         serde_json::from_slice(raw).map_err(|e| format!("invalid spec json: {}", e))?;
@@ -65,14 +68,8 @@ fn run_job(raw: &[u8]) -> Result<JobResult, String> {
     })
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: floria_merge <spec.json | ->");
-        process::exit(2);
-    }
-
-    let raw = if args[1] == "-" {
+fn read_input(arg: &str) -> Vec<u8> {
+    if arg == "-" {
         let mut buf = Vec::new();
         if let Err(e) = io::stdin().read_to_end(&mut buf) {
             eprintln!("read stdin failed: {}", e);
@@ -80,30 +77,100 @@ fn main() {
         }
         buf
     } else {
-        match fs::read(&args[1]) {
+        match fs::read(arg) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("read {} failed: {}", args[1], e);
+                eprintln!("read {} failed: {}", arg, e);
                 process::exit(1);
             }
         }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("usage: floria_merge [merge|prep|postchunk|runbatch] <spec.json | ->");
+        process::exit(2);
+    }
+
+    let (mode, spec_arg) = match args[1].as_str() {
+        "merge" | "prep" | "postchunk" | "runbatch" => {
+            if args.len() < 3 {
+                eprintln!("usage: floria_merge {} <spec.json | ->", args[1]);
+                process::exit(2);
+            }
+            (args[1].as_str(), args[2].as_str())
+        }
+        _ => ("merge", args[1].as_str()),
     };
 
-    match run_job(&raw) {
-        Ok(res) => {
-            println!("{}", serde_json::to_string(&res).unwrap());
+    let raw = read_input(spec_arg);
+
+    match mode {
+        "prep" => {
+            let res: Result<prep::PrepResult, String> = serde_json::from_slice::<prep::PrepSpec>(&raw)
+                .map_err(|e| format!("invalid prep json: {}", e))
+                .and_then(|s| prep::run(&s));
+            match res {
+                Ok(r) => println!("{}", serde_json::to_string(&r).unwrap()),
+                Err(err) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"ok": false, "error": err})
+                    );
+                    process::exit(1);
+                }
+            }
         }
-        Err(err) => {
-            let res = JobResult {
-                ok: false,
-                total_pages: 0,
-                pdf_ms: 0.0,
-                synctex_ms: 0.0,
-                total_ms: 0.0,
-                error: Some(err.clone()),
-            };
-            eprintln!("{}", serde_json::to_string(&res).unwrap());
-            process::exit(1);
+        "postchunk" => {
+            let res: Result<postchunk::PostChunkResult, String> =
+                serde_json::from_slice::<postchunk::PostChunkSpec>(&raw)
+                    .map_err(|e| format!("invalid postchunk json: {}", e))
+                    .and_then(|s| postchunk::run_one(&s));
+            match res {
+                Ok(r) => println!("{}", serde_json::to_string(&r).unwrap()),
+                Err(err) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"ok": false, "error": err})
+                    );
+                    process::exit(1);
+                }
+            }
         }
+        "runbatch" => {
+            let res: Result<runner::BatchResult, String> =
+                serde_json::from_slice::<runner::BatchSpec>(&raw)
+                    .map_err(|e| format!("invalid runbatch json: {}", e))
+                    .and_then(|s| runner::run(&s));
+            match res {
+                Ok(r) => println!("{}", serde_json::to_string(&r).unwrap()),
+                Err(err) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"event": "result", "ok": false, "error": err})
+                    );
+                    process::exit(1);
+                }
+            }
+        }
+        _ => match run_merge_job(&raw) {
+            Ok(res) => {
+                println!("{}", serde_json::to_string(&res).unwrap());
+            }
+            Err(err) => {
+                let res = JobResult {
+                    ok: false,
+                    total_pages: 0,
+                    pdf_ms: 0.0,
+                    synctex_ms: 0.0,
+                    total_ms: 0.0,
+                    error: Some(err),
+                };
+                eprintln!("{}", serde_json::to_string(&res).unwrap());
+                process::exit(1);
+            }
+        },
     }
 }

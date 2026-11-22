@@ -83,7 +83,7 @@ button { font-family: inherit; cursor: pointer; }
 .pv-page {
   flex: 0 0 auto; background: #fff; box-shadow: 0 2px 16px rgba(0, 0, 0, .16);
   border-radius: 2px; overflow: hidden; scroll-snap-align: start; position: relative;
-  cursor: crosshair;                 /* 点击 = 跳转源码 */
+  cursor: default;                   /* 双击 = 跳转源码；单击留给标记 */
 }
 .pv-page canvas { display: block; }
 .pv-mark {
@@ -123,6 +123,34 @@ button { font-family: inherit; cursor: pointer; }
 }
 .vt-icon:hover { background: var(--accent-soft); color: var(--ink); }
 .vt-icon.on { background: var(--accent-soft); color: var(--ink); }
+
+/* 标记（高亮笔）：按钮 + 颜色面板（顶栏左侧，目录按钮旁） */
+.v-annotwrap { position: relative; }
+#annot-panel {
+  position: absolute; top: calc(100% + 8px); left: 0; width: 196px; padding: 12px; z-index: 70;
+  display: flex; flex-direction: column; gap: 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow);
+}
+.ap-title { font-size: 12px; font-weight: 600; color: var(--ink-soft); }
+.ap-colors { display: flex; gap: 9px; }
+.ap-color {
+  width: 22px; height: 22px; border-radius: 50%; border: 1px solid rgba(0, 0, 0, .12);
+  background: var(--c); padding: 0;
+}
+.ap-color:hover { transform: scale(1.08); }
+.ap-color.on { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--ink); }
+.ap-clear {
+  margin-top: 2px; padding: 5px 0; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); color: var(--ink-soft); font-size: 12px;
+}
+.ap-clear:hover { background: var(--accent-soft); color: var(--ink); border-color: var(--border-strong); }
+
+/* 标记层：笔画存 SVG（pt 坐标，随页尺寸缩放），不吃指针；标记模式下页面变画布、内链不可点 */
+.pv-annot { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.pv-annot polyline { mix-blend-mode: multiply; stroke-opacity: .45; }
+.pv-annot circle { mix-blend-mode: multiply; fill-opacity: .45; }
+#pdf-pages.annot-mode .pv-page { cursor: crosshair; touch-action: none; }
+#pdf-pages.annot-mode .pv-links { pointer-events: none; }
 
 /* 工具 tab 条（内容由 js/toolbar.js 渲染；贴在工具卡卡头，观感照 Prism 的 工具面板 tab 条）
    —— 扁平文字 tab（不是浮条胶囊）：active = 文字加深 + 底部一条 1.5px 下划线 */

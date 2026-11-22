@@ -17,6 +17,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 
 KIT_VER = 1
@@ -121,8 +122,8 @@ def _strip_cmd_with_args(text, cmd, n_opt=0, n_req=1):
     return ''.join(out)
 
 
-def _remove_pkg_from_preamble(preamble, pkg_name):
-    """从导言区移除 \\usepackage[...]{pkg}（支持逗号列表里的单项剥离）。"""
+def _remove_pkg_from_preamble(preamble, pkg_name, replace_pkgs=()):
+    """从导言区移除 \\usepackage[...]{pkg}（支持逗号列表里的单项剥离与轻量替代包注入）。"""
     pat = re.compile(r'\\usepackage\s*(\[[^\]]*\])?\s*\{([^{}]*)\}')
 
     def repl(m):
@@ -134,9 +135,10 @@ def _remove_pkg_from_preamble(preamble, pkg_name):
         kept = [p for p in pkgs if p != pkg_name]
         if len(kept) == len(pkgs):
             return m.group(0)
+        shim = ''.join('\\usepackage{%s}' % sp for sp in replace_pkgs if sp not in kept)
         if not kept:
-            return ''
-        return '\\usepackage%s{%s}' % (opt, ','.join(kept))
+            return shim
+        return '\\usepackage%s{%s}%s' % (opt, ','.join(kept), shim)
 
     return pat.sub(repl, preamble)
 
@@ -156,18 +158,22 @@ def strip_preamble(preamble, used_text='', for_kit=False):
         pre_nc))
 
     need_chemfig = (not for_kit) and bool(re.search(
-        r'\\(?:chemfig|schemestart|chemname|lewis)\b', txt))
+        r'\\(?:chemfig|schemestart|chemname|lewis|chemmove|polymerdelim)\b', txt))
     need_mhchem = (not for_kit) and bool(re.search(r'\\ce\b|\\pu\b', txt))
     need_tikzcd = (not for_kit) and ('tikzcd' in txt)
     need_pgfplots = (not for_kit) and bool(re.search(r'\\begin\{axis\}|\\pgfplot|\\addplot\b', txt))
     need_tikz = (
         need_chemfig or need_tikzcd or need_pgfplots or has_tikz_dep_pkg
         or ((not for_kit) and bool(re.search(
-            r'tikzpicture|\\tikz\b|\\draw\b|\\node\b|\\pgf', txt)))
+            r'tikzpicture|\\tikz(?:set)?\b|\\usetikzlibrary\b|\\draw\b|\\node\b|\\pgf', txt)))
     )
     need_longtable = (not for_kit) and ('longtable' in txt)
-    need_tabularx = (not for_kit) and ('tabularx' in txt)
-    need_subcaption = (not for_kit) and bool(re.search(r'subfigure|subtable|\\subcaption\b', txt))
+    need_tabularx = (not for_kit) and bool(re.search(
+        r'tabularx|\\arraybackslash\b|\\extrarowheight\b|\\newcolumntype\b|>\{|<\{',
+        txt + '\n' + pre_nc))
+    need_subcaption = (not for_kit) and bool(re.search(
+        r'subfigure|subtable|\\subcaption\b|\\captionsetup\b|\\captionof\b',
+        txt + '\n' + pre_nc))
     need_booktabs = (not for_kit) and bool(re.search(r'\\(?:toprule|midrule|bottomrule|cmidrule|addlinespace)\b', txt))
     need_float = (not for_kit) and bool(re.search(r'\[H\]|\\(?:floatstyle|newfloat|restylefloat|floatplacement)\b', txt))
 
@@ -198,7 +204,16 @@ def strip_preamble(preamble, used_text='', for_kit=False):
         out = _remove_pkg_from_preamble(out, 'pgfplots')
         out = _strip_cmd_with_args(out, 'pgfplotsset', 0, 1)
     if not need_tikz:
-        out = _remove_pkg_from_preamble(out, 'tikz')
+        tikz_shims = []
+        if not for_kit:
+            combined_nc = pre_nc + '\n' + txt
+            if (not re.search(r'\\usepackage(?:\[[^\]]*\])?\{[^{}]*\bxcolor\b', pre_nc)
+                    and re.search(r'\\(?:definecolor|color|textcolor|colorbox|fcolorbox|pagecolor)\b', combined_nc)):
+                tikz_shims.append('xcolor')
+            if (not re.search(r'\\usepackage(?:\[[^\]]*\])?\{[^{}]*\bgraphicx\b', pre_nc)
+                    and re.search(r'\\(?:includegraphics|scalebox|resizebox|rotatebox)\b', combined_nc)):
+                tikz_shims.append('graphicx')
+        out = _remove_pkg_from_preamble(out, 'tikz', replace_pkgs=tikz_shims)
         out = _strip_cmd_with_args(out, 'usetikzlibrary', 0, 1)
         out = _strip_cmd_with_args(out, 'tikzset', 0, 1)
     if not need_longtable:
@@ -235,6 +250,59 @@ def can_decouple(preamble, front, chunks):
         if re.search(re.escape(cmd) + r'(?![A-Za-z@])', body_nc):
             return False
     return True
+
+
+_INC_GRAPH_RE = re.compile(r'\\includegraphics(?:\s*\[[^\]]*\])?\s*\{([^{}]+)\}')
+_IMG_EXTS = ('.pdf', '.png', '.jpg', '.jpeg', '.bmp', '.gif')
+
+
+def floria_fast_defs(used_text='', image_dims=None):
+    """注入零 Poppler 嵌入宏 \\FloriaPdf + 消除 .bb 探测 + 已有配图尺寸预注入。"""
+    lines = [
+        r'\makeatletter',
+        r'\DeclareRobustCommand{\FloriaPdf}[4]{\ifvmode\leavevmode\fi\hbox{\lower#1\hbox{\setbox0=\hbox{\special{pdf:image (#4)}}\dp0=0pt\ht0=#3\wd0=#2\box0}}}',
+        r'\AddToHook{begindocument/before}{\ifcsname Gread@@xetex\endcsname\def\Gread@@xetex#1{\Gread@@xetex@aux#1}\fi}',
+    ]
+    if image_dims and used_text and '\\includegraphics' in used_text:
+        seen = set()
+        for m in _INC_GRAPH_RE.finditer(used_text):
+            raw_p = m.group(1).strip().replace('\\', '/')
+            if raw_p.startswith('image/'):
+                bn = raw_p[6:]
+            elif '/' not in raw_p:
+                bn = raw_p
+            else:
+                continue
+            if not bn or any(c in bn for c in '%\\{}#~^$'):
+                continue
+            cand = None
+            full_rel = None
+            if bn in image_dims:
+                cand = image_dims[bn]
+                full_rel = 'image/' + bn
+            elif '.' not in os.path.basename(bn):
+                for ext in _IMG_EXTS:
+                    if (bn + ext) in image_dims:
+                        cand = image_dims[bn + ext]
+                        full_rel = 'image/' + bn + ext
+                        break
+            if cand is None or full_rel in seen:
+                continue
+            seen.add(full_rel)
+            w_pt, h_pt, is_pdf = float(cand[0]), float(cand[1]), bool(cand[2])
+            lines.append(
+                '\\expandafter\\def\\csname %s width\\endcsname{%.5fpt}'
+                '\\expandafter\\def\\csname %s height\\endcsname{%.5fpt}'
+                % (full_rel, w_pt, full_rel, h_pt)
+            )
+            if is_pdf:
+                lines.append(
+                    '\\expandafter\\def\\csname %s width:cropbox\\endcsname{%.5fpt}'
+                    '\\expandafter\\def\\csname %s height:cropbox\\endcsname{%.5fpt}'
+                    % (full_rel, w_pt, full_rel, h_pt)
+                )
+    lines.append(r'\makeatother')
+    return '\n'.join(lines) + '\n'
 
 
 def decoupled_hook_code():
@@ -531,19 +599,29 @@ def ensure_kit(book_dir, preamble, env, texcmd='xelatex', xelatex_alt='', xdvipd
         rel_tex = rel_dir + '/kit.tex'
         rel_xdv = rel_dir + '/kit.xdv'
         rel_pdf = rel_dir + '/kit.pdf'
+        xe_bin = xelatex_alt if (xelatex_alt and os.path.isfile(xelatex_alt)) else texcmd
+        xdv_bin = xdvipdfmx_alt if (xdvipdfmx_alt and os.path.isfile(xdvipdfmx_alt)) else 'xdvipdfmx'
+
+        def _xe_args(b):
+            a = [b]
+            if 'miktex' in b.lower():
+                a.append('--disable-installer')
+            a.extend(['-no-pdf', '-interaction=nonstopmode', '-halt-on-error',
+                      '-output-directory=' + rel_dir, rel_tex])
+            return a
+
         try:
             p1 = subprocess.run(
-                [texcmd, '-no-pdf', '-interaction=nonstopmode', '-halt-on-error',
-                 '-output-directory=' + rel_dir, rel_tex],
+                _xe_args(xe_bin),
                 cwd=book_dir, timeout=60, capture_output=True, text=True,
                 encoding='utf-8', errors='replace', creationflags=flags, env=e,
             )
         except FileNotFoundError:
-            if not xelatex_alt:
+            fb = xelatex_alt if xe_bin != xelatex_alt else texcmd
+            if not fb:
                 return False
             p1 = subprocess.run(
-                [xelatex_alt, '-no-pdf', '-interaction=nonstopmode', '-halt-on-error',
-                 '-output-directory=' + rel_dir, rel_tex],
+                _xe_args(fb),
                 cwd=book_dir, timeout=60, capture_output=True, text=True,
                 encoding='utf-8', errors='replace', creationflags=flags, env=e,
             )
@@ -551,15 +629,16 @@ def ensure_kit(book_dir, preamble, env, texcmd='xelatex', xelatex_alt='', xdvipd
             return False
         try:
             p2 = subprocess.run(
-                ['xdvipdfmx', '-E', '-z', '1', '-o', rel_pdf, rel_xdv],
+                [xdv_bin, '-E', '-z', '1', '-o', rel_pdf, rel_xdv],
                 cwd=book_dir, timeout=60, capture_output=True, text=True,
                 encoding='utf-8', errors='replace', creationflags=flags, env=e,
             )
         except FileNotFoundError:
-            if not xdvipdfmx_alt:
+            fb_xdv = xdvipdfmx_alt if xdv_bin != xdvipdfmx_alt else 'xdvipdfmx'
+            if not fb_xdv:
                 return False
             p2 = subprocess.run(
-                [xdvipdfmx_alt, '-E', '-z', '1', '-o', rel_pdf, rel_xdv],
+                [fb_xdv, '-E', '-z', '1', '-o', rel_pdf, rel_xdv],
                 cwd=book_dir, timeout=60, capture_output=True, text=True,
                 encoding='utf-8', errors='replace', creationflags=flags, env=e,
             )
@@ -896,6 +975,138 @@ def run_native_merge(pdf_args=None, synctex_args=None, timeout=120):
     if not isinstance(res, dict) or not res.get('ok'):
         return None
     return res
+
+
+def run_native_prep(book_dir, chunk_ids=None, deltas=None, include_front=False,
+                    write_agg_aux=True, scan_images=True, upgrade_tikz_dp=True,
+                    timeout=30):
+    """调用 Rust 原生预处理：并发扫描/缓存 image/ 物理尺寸、升级旧 .dp、聚合并平移 main.aux。"""
+    exe = find_native_merger()
+    if not exe:
+        return None
+    spec = {
+        'book_dir': book_dir,
+        'chunk_ids': list(chunk_ids or ()),
+        'deltas': {str(k): int(v) for k, v in deltas.items()} if deltas is not None else None,
+        'include_front': bool(include_front),
+        'write_agg_aux': bool(write_agg_aux),
+        'scan_images': bool(scan_images),
+        'upgrade_tikz_dp': bool(upgrade_tikz_dp),
+    }
+    payload = json.dumps(spec, ensure_ascii=False).encode('utf-8')
+    try:
+        proc = subprocess.run(
+            [exe, 'prep', '-'],
+            input=payload,
+            capture_output=True,
+            timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        res = json.loads(proc.stdout.decode('utf-8', errors='replace'))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(res, dict) or not res.get('ok'):
+        return None
+    return res
+
+
+def run_native_batch(spec, on_xelatex_done=None, timeout=480):
+    """调用 Rust 原生批处理调度器（Rayon 并发 xelatex + xdvipdfmx + postchunk + 事务快照回滚）。
+
+    支持流式 JSONL 事件（`on_xelatex_done` 实时触发，使前置页与末块 xdvipdfmx 重叠）。
+    成功通信返回 `BatchResult` 字典；无可用二进制或通信异常时返回 None，由调用方自动回退 Python 路径。
+    """
+    exe = find_native_merger()
+    if not exe:
+        return None
+    payload = json.dumps(spec, ensure_ascii=False).encode('utf-8')
+    flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    try:
+        proc = subprocess.Popen(
+            [exe, 'runbatch', '-'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=flags,
+        )
+    except OSError:
+        return None
+
+    def _feed():
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    feeder = threading.Thread(target=_feed, daemon=True)
+    feeder.start()
+
+    def _drain_err():
+        try:
+            proc.stderr.read()
+        except OSError:
+            pass
+
+    err_th = threading.Thread(target=_drain_err, daemon=True)
+    err_th.start()
+
+    final_res = [None]
+
+    def _read_out():
+        try:
+            for raw_ln in iter(proc.stdout.readline, b''):
+                s = raw_ln.decode('utf-8', errors='replace').strip()
+                if not s:
+                    continue
+                try:
+                    evt = json.loads(s)
+                except ValueError:
+                    continue
+                if not isinstance(evt, dict):
+                    continue
+                ev_type = evt.get('event')
+                if ev_type == 'xelatex_done':
+                    if on_xelatex_done is not None:
+                        try:
+                            on_xelatex_done()
+                        except Exception:
+                            pass
+                elif ev_type == 'result':
+                    final_res[0] = evt
+        except OSError:
+            pass
+
+    out_th = threading.Thread(target=_read_out, daemon=True)
+    out_th.start()
+
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return None
+    finally:
+        feeder.join(timeout=2)
+        out_th.join(timeout=5)
+        err_th.join(timeout=2)
+        for stream in (proc.stdout, proc.stderr, proc.stdin):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    if rc != 0 or not isinstance(final_res[0], dict) or 'results' not in final_res[0]:
+        return None
+    return final_res[0]
 
 
 def _encode_digits(s, fspec):

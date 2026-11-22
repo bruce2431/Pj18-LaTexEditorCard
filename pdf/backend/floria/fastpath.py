@@ -548,22 +548,29 @@ def _agg_labels(book_dir):
 _PAGE_FIELD_RE = re.compile(r'^(\\newlabel\{[^{}]*\}\{\{[^{}]*\})\{[^{}]*\}')
 
 
-def _xref_sig(text, labels):
-    """块内引用目标在聚合 aux 里的定义指纹（无引用 → None，与旧缓存天然相等）。
+_LABEL_DEF_RE = re.compile(r'\\label\s*\{([^{}]*)\}')
+
+
+def _xref_sig(text, labels, include_own=False):
+    """块内跨块引用目标在聚合 aux 里的定义指纹（无跨块引用 → None，与旧缓存天然相等）。
 
     块正文没变、被引标签却改了编号或锚点名时，旧分片里的链接仍指向旧目标；
     合并时同名目标取「第一份出现的」（`_merge_pdfs` 的 setdefault），于是点到另一处。
     实测：把 `\\paragraph` 提成 `\\subsection` 后，第 110 页的 [16] 跳到了 106 页。
 
+    本块自身定义的 `\\label` 由本块 `wrapper.aux` 直接解析，不走 `xr-hyper`，因此排除在
+    跨块指纹之外，避免块内自引用在重编后误触发二次 `xref_dirty` 重编。
+
     **页码子字段不参与指纹**：跨块引用在 PDF 里是 GoToR + 命名锚点
     （`/D = 'subsection.4.2.8'`），合并时按名字重定向；被引标签只是页码平移
-    （`{{编号}{页码}` 的第二个字段变化）时，引用块的 PDF 依然有效。把页码算进去
-    会让任何一处页码偏移都把全部带引用的块判 stale，再触发整批重编——那是
-    一次改稿编译从 ~30s 涨到 ~55s 的主因（同一起编辑里先按旧起始页编一遍，
-    布局迭代后还要再编一遍）。
+    （`{{编号}{页码}` 的第二个字段变化）时，引用块的 PDF 依然有效。
     """
+    own_defs = set() if include_own else {
+        m.group(1).strip() for m in _LABEL_DEF_RE.finditer(text or '')
+    }
     names = sorted({n.strip() for _cmd, grp in _XREF_RE.findall(text or '')
-                    for n in grp.split(',') if n.strip()})
+                    for n in grp.split(',')
+                    if n.strip() and n.strip() not in own_defs})
     if not names:
         return None
     h = hashlib.md5()
@@ -1033,6 +1040,9 @@ def _ensure_slim_items(items):
 
 def _merge_synctex_cached(items, out):
     """带缓存的 SyncTeX 合并：优先走 Rust 原生合并，其次预处理 `.slim` 极速路径。"""
+    if _merge_synctex is not _ORIG_MERGE_SYNCTEX:
+        _merge_synctex(items, out)
+        return True
     if _synctex_cache_hit(items, out):
         return False
     if _ensure_slim_items(items):
@@ -1188,6 +1198,9 @@ def _merge_synctex(items, out):
     os.replace(tmp, out)
 
 
+_ORIG_MERGE_SYNCTEX = _merge_synctex
+
+
 def _outline_starts(main_pdf):
     """整本书 PDF 顶层书签的页码（1 基）。
 
@@ -1281,19 +1294,108 @@ _ANY_REF_RE = re.compile(
 )
 
 
-def _compile_piece(book_dir, cid, preamble, text, inject, env,
-                   texcmd, xelatex_alt, xdvipdfmx_alt, toc_seed=None, timeout=420,
-                   single_pass=False, ignore_abspage=False, decoupled=False,
-                   on_xelatex_done=None):
-    """编一块（章 / 前置页）：产物在 .build/floria/out/<cid>/。
+_SYNTAX_ERR_PATS = (
+    'File ended while scanning use of',
+    'Runaway argument?',
+    'Paragraph ended before',
+    'Missing $ inserted',
+    'Display math should end with $$',
+    'Missing { inserted',
+    'Missing } inserted',
+    'Extra }, or forgotten',
+    "Too many }'s",
+    'Misplaced alignment tab character &',
+    'Extra alignment tab has been changed',
+    'Misplaced \\noalign',
+    'Unable to load picture or PDF file',
+    'Double subscript',
+    'Double superscript',
+    'Text line contains an invalid character',
+    "There's no line here to end",
+    'Lonely \\item',
+)
+_MISSING_FILE_RE = re.compile(r"LaTeX Error: File `([^']+)' not found")
+_UNDEF_CS_MACRO_RE = re.compile(r'\\([A-Za-z@]+)\s*$')
+_STRIPPED_MACRO_PREFIXES = (
+    'tikz', 'pgf', 'chem', 'scheme', 'setchem', 'definesubmol', 'lewis',
+    'arrow', 'polymerdelim', 'ce', 'pu', 'toprule', 'midrule', 'bottomrule',
+    'cmidrule', 'addlinespace', 'specialrule', 'subcaption', 'subfigure',
+    'subtable', 'caption', 'longtable', 'endfirsthead', 'endhead', 'endfoot',
+    'endlastfoot', 'tabularx', 'array', 'extrarowheight', 'newcolumntype',
+    'addplot', 'axis', 'float', 'restylefloat', 'newfloat',
+    'color', 'textcolor', 'colorbox', 'definecolor',
+)
+_STRIPPED_TIKZ_CMDS = frozenset((
+    'draw', 'node', 'fill', 'filldraw', 'path', 'clip', 'coordinate', 'shadedraw',
+))
 
-    优化：
-      - 重型 TikZ 块先经 `tikz_cache` 批量预编译缓存（严格等行数替换，不破坏 SyncTeX）；
-      - 按块实际用到的宏包安全精简导言区（失败自动回退完整导言区），无跨块引用时跳过 xr-hyper；
-      - 页码解耦模式下注入 `/FTOC`/`/FPR`/`/FATLAS` 与 `.fmeta` 钩子，严格 1 遍收敛；
-      - `xelatex` 刚写完 `.toc`/`.fmeta` 立即触发 `on_xelatex_done` 回调，允许 `front` 与本块
-        `xdvipdfmx` 并行重叠；随后记录 `PATCH` 页索引并产出 `.synctex.slim` 精简映射。
-    """
+
+def _take_aux_snapshot(outdir):
+    snap = []
+    for name in ('wrapper.aux', 'wrapper.out', 'wrapper.toc', 'wrapper.fmeta'):
+        p = os.path.join(outdir, name)
+        try:
+            with open(p, 'rb') as f:
+                snap.append((p, f.read()))
+        except OSError:
+            snap.append((p, None))
+    return snap
+
+
+def _restore_aux_snapshot(snap):
+    for p, data in snap:
+        if data is None:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        else:
+            tmp = p + '.snap_tmp'
+            try:
+                with open(tmp, 'wb') as f:
+                    f.write(data)
+                os.replace(tmp, p)
+            except OSError:
+                pass
+
+
+def _should_retry_with_full_preamble(out, outdir):
+    """区分精简导言区可能误剥的宏错误与确定性的用户语法/配图缺失错误（后者直接秒级快退）。"""
+    log_text = ''
+    try:
+        with open(os.path.join(outdir, 'wrapper.log'), encoding='utf-8', errors='replace') as f:
+            log_text = f.read()
+    except OSError:
+        pass
+    combined = log_text if log_text else (out or '')
+    for pat in _SYNTAX_ERR_PATS:
+        if pat in combined:
+            return False
+    if 'LaTeX Error: \\begin{' in combined and 'ended by \\end{' in combined:
+        return False
+    for m in _MISSING_FILE_RE.finditer(combined):
+        fn = m.group(1).lower()
+        if not fn.endswith(('.sty', '.cls', '.def', '.fd', '.cfg', '.clo', '.tex')):
+            return False
+    idx = combined.find('Undefined control sequence')
+    if idx >= 0:
+        lines = combined[idx:].splitlines()[1:5]
+        for ln in lines:
+            mc = _UNDEF_CS_MACRO_RE.search(ln)
+            if mc:
+                macro = mc.group(1)
+                if '@' in macro:
+                    return True
+                return (macro.startswith(_STRIPPED_MACRO_PREFIXES)
+                        or macro in _STRIPPED_TIKZ_CMDS)
+    return True
+
+
+def _prepare_piece_job(book_dir, cid, preamble, text, inject, env,
+                       texcmd, xelatex_alt, xdvipdfmx_alt, toc_seed=None,
+                       single_pass=False, ignore_abspage=False, decoupled=False,
+                       image_dims=None, counter_deltas=None):
+    """构造单块编译任务（供 Rust `runbatch` 与 Python `_compile_piece` 共用）。"""
     text_for_tex = text
     if toc_seed is None and text:
         try:
@@ -1303,15 +1405,12 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
             text_for_tex = text
 
     _write_if_changed(os.path.join(book_dir, CHUNK_DIR, cid + '.tex'), text_for_tex)
-    outdir = _chunk_dir(book_dir, cid)
-    os.makedirs(outdir, exist_ok=True)
-    wrapper = os.path.join(outdir, 'wrapper.tex')
     opener = '' if toc_seed is not None else \
         '\\makeatletter\\setbox\\z@\\vbox{\\@starttoc{toc}}\\makeatother\n'
     hook = pdf_stamp.decoupled_hook_code() if decoupled else ''
 
-    # 精简未使用的重型宏包（tikz/tikz-cd/chemfig/mhchem/pgfplots/booktabs/float 等）
     used_for_strip = text_for_tex + ('\n' + toc_seed if toc_seed else '')
+    fast_defs = pdf_stamp.floria_fast_defs(used_for_strip, image_dims=image_dims)
     pre_eff = pdf_stamp.strip_preamble(preamble, used_for_strip)
     used_stripped = (pre_eff != preamble)
     need_xr = bool(_ANY_REF_RE.search(used_for_strip))
@@ -1320,20 +1419,90 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
         '\\externaldocument{.build/floria/agg/main}}{}\n'
     ) if need_xr else ''
 
-    def write_wrapper(pre_src):
-        wrap = (pre_src + '\n'
+    def _make_wrap(pre_src):
+        return (pre_src + '\n'
+                + fast_defs
                 + xr_line
                 + hook + '\n'
                 + '\\begin{document}\n'
-                # 必须用 begindocument/end 钩子（\\AtBeginDocument 太早：ctexbook 会在
-                # 章节前 \\cleardoublepage 多插一张空白页，实测每章各多 1 页）。
                 + '\\AddToHook{begindocument/end}{%s}\n' % inject
                 + opener
                 + '\\input{%s}\n' % os.path.join(CHUNK_DIR, cid + '.tex').replace('\\', '/')
                 + '\\end{document}\n')
-        _write_if_changed(wrapper, wrap)
 
-    write_wrapper(pre_eff)
+    wrap_stripped = _make_wrap(pre_eff)
+    wrap_full = _make_wrap(preamble) if used_stripped else None
+
+    page_refs = False if decoupled else bool(_PAGE_REF_RE.search(text))
+    ref_names = None if page_refs else sorted({
+        m.group(1).strip()
+        for m in re.finditer(r'\\(?:ref|autoref|eqref|cref|Cref)\s*\*?\s*\{([^{}]*)\}', text)
+    })
+    return {
+        'cid': cid,
+        'wrapper_stripped': wrap_stripped,
+        'wrapper_full': wrap_full,
+        'toc_seed': toc_seed,
+        'single_pass': bool(single_pass),
+        'ignore_abspage': bool(ignore_abspage),
+        'decoupled': bool(decoupled),
+        'page_refs': bool(page_refs),
+        'ref_names': ref_names,
+        'counter_deltas': counter_deltas or {},
+    }
+
+
+def _resolve_portable_bins(texcmd, xelatex_alt, xdvipdfmx_alt):
+    xe = xelatex_alt if (xelatex_alt and os.path.isfile(xelatex_alt)) else texcmd
+    xdv = xdvipdfmx_alt if (xdvipdfmx_alt and os.path.isfile(xdvipdfmx_alt)) else 'xdvipdfmx'
+    is_miktex = ('miktex' in (xe or '').lower()) or ('miktex' in (xelatex_alt or '').lower())
+    return xe, xdv, is_miktex
+
+
+def _compile_piece(book_dir, cid, preamble, text, inject, env,
+                   texcmd, xelatex_alt, xdvipdfmx_alt, toc_seed=None, timeout=420,
+                   single_pass=False, ignore_abspage=False, decoupled=False,
+                   on_xelatex_done=None, image_dims=None, counter_deltas=None):
+    """编一块（章 / 前置页）：优先走 Rust `runbatch`，无二进制时无缝回退 Python 事务路径。"""
+    job = _prepare_piece_job(
+        book_dir, cid, preamble, text, inject, env,
+        texcmd, xelatex_alt, xdvipdfmx_alt, toc_seed=toc_seed,
+        single_pass=single_pass, ignore_abspage=ignore_abspage,
+        decoupled=decoupled, image_dims=image_dims,
+        counter_deltas=counter_deltas,
+    )
+    xe_bin, xdv_bin, is_miktex = _resolve_portable_bins(texcmd, xelatex_alt, xdvipdfmx_alt)
+    native_batch = pdf_stamp.run_native_batch(
+        {
+            'book_dir': book_dir,
+            'xelatex': xe_bin,
+            'xdvipdfmx': xdv_bin,
+            'is_miktex': is_miktex,
+            'max_parallel': 1,
+            'timeout_secs': int(timeout),
+            'stream_events': bool(on_xelatex_done is not None),
+            'env': {str(k): str(v) for k, v in (env or {}).items()},
+            'jobs': [job],
+        },
+        on_xelatex_done=on_xelatex_done,
+        timeout=timeout + 30,
+    )
+    if native_batch is not None and native_batch.get('results'):
+        r0 = native_batch['results'][0]
+        return {
+            'ok': bool(r0.get('ok')),
+            'secs': float(r0.get('secs') or 0.0),
+            'out': r0.get('out') or '',
+            'pdf': r0.get('pdf') or _chunk_pdf(book_dir, cid),
+            'synctex': r0.get('synctex') or _chunk_sync(book_dir, cid),
+        }
+
+    outdir = _chunk_dir(book_dir, cid)
+    os.makedirs(outdir, exist_ok=True)
+    snap = _take_aux_snapshot(outdir)
+    wrapper = os.path.join(outdir, 'wrapper.tex')
+    _write_if_changed(wrapper, job['wrapper_stripped'])
+    used_stripped = bool(job['wrapper_full'])
 
     e = env.copy()
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -1348,15 +1517,10 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
         out += (p.stdout or '') + (p.stderr or '')
         return p.returncode
 
-    # 本块自引用：`\ref`/`\autoref`/`\eqref`/`\cref` 印的是**编号**（1.2 这种）。
-    # 解耦模式下 `\pageref` 由合并阶段 `/FPR` 原位热更新，不再拖慢块收敛。
-    page_refs = False if decoupled else bool(_PAGE_REF_RE.search(text))
-    ref_names = None if page_refs else set(
-        m.group(1).strip() for m in re.finditer(r'\\(?:ref|autoref|eqref|cref|Cref)\s*\*?\s*\{([^{}]*)\}',
-                                                text))
+    page_refs = job['page_refs']
+    ref_names = set(job['ref_names']) if job['ref_names'] is not None else None
 
     def label_num_sig(names):
-        """aux 里这些标签的「编号」字段：`\\newlabel{名}{{编号}{页码}…}` 只取编号。"""
         if not names:
             return {}
         try:
@@ -1378,7 +1542,6 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
             return set()
 
     def _log_needs_rerun():
-        """检查 wrapper.log 是否要求重跑（longtable 宽变更 / 本块已定义却仍报 undefined 的前向引用）。"""
         try:
             with open(os.path.join(outdir, 'wrapper.log'), encoding='utf-8', errors='replace') as f:
                 lg = f.read()
@@ -1421,19 +1584,25 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
         except OSError:
             pass
 
+    def _xe_args(cmd_bin):
+        args = [cmd_bin]
+        if 'miktex' in cmd_bin.lower():
+            args.append('--disable-installer')
+        args.extend(['-no-pdf', '-synctex=1', '-interaction=nonstopmode',
+                     '-halt-on-error', '-file-line-error',
+                     '-output-directory=' + rel_out, rel_wrap])
+        return args
+
     def run_xelatex():
-        nonlocal texcmd
+        nonlocal xe_bin
         try:
-            return run([texcmd, '-no-pdf', '-synctex=1', '-interaction=nonstopmode',
-                        '-halt-on-error', '-file-line-error',
-                        '-output-directory=' + rel_out, rel_wrap])
+            return run(_xe_args(xe_bin))
         except FileNotFoundError:
-            if not xelatex_alt:
+            alt = xelatex_alt if xe_bin != xelatex_alt else texcmd
+            if not alt:
                 raise
-            texcmd = xelatex_alt
-            return run([texcmd, '-no-pdf', '-synctex=1', '-interaction=nonstopmode',
-                        '-halt-on-error', '-file-line-error',
-                        '-output-directory=' + rel_out, rel_wrap])
+            xe_bin = alt
+            return run(_xe_args(xe_bin))
 
     rc = 1
     max_passes = 1 if single_pass else 4
@@ -1442,11 +1611,11 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
         refs_before = label_num_sig(ref_names)
         seed()
         rc = run_xelatex()
-        if rc != 0 and p_idx == 0 and used_stripped:
-            # 精简导言区偶发宏依赖缺失 → 无感回退完整导言区重试
+        if rc != 0 and p_idx == 0 and used_stripped and _should_retry_with_full_preamble(out, outdir):
             out = ''
             used_stripped = False
-            write_wrapper(preamble)
+            _restore_aux_snapshot(snap)
+            _write_if_changed(wrapper, job['wrapper_full'])
             seed()
             rc = run_xelatex()
         if rc != 0:
@@ -1469,13 +1638,14 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
 
     if rc == 0:
         try:
-            rc = run(['xdvipdfmx', '-E', '-z', '1', '-o', rel_pdf, rel_xdv])
+            rc = run([xdv_bin, '-E', '-z', '1', '-o', rel_pdf, rel_xdv])
         except FileNotFoundError:
-            if not xdvipdfmx_alt:
+            alt_xdv = xdvipdfmx_alt if xdv_bin != xdvipdfmx_alt else 'xdvipdfmx'
+            if not alt_xdv:
                 raise
-            rc = run([xdvipdfmx_alt, '-E', '-z', '1', '-o', rel_pdf, rel_xdv])
+            rc = run([alt_xdv, '-E', '-z', '1', '-o', rel_pdf, rel_xdv])
 
-    if rc == 0:
+    if rc == 0 and os.path.isfile(_chunk_pdf(book_dir, cid)):
         max_pg = None
         if decoupled:
             fmeta_p = _chunk_fmeta(book_dir, cid)
@@ -1488,8 +1658,11 @@ def _compile_piece(book_dir, cid, preamble, text, inject, env,
                                 cid + '.tex', max_pages=max_pg)
         except Exception:                   # noqa: BLE001
             pass
+    else:
+        _restore_aux_snapshot(snap)
 
-    return {'ok': rc == 0, 'secs': time.time() - t0, 'out': out,
+    return {'ok': rc == 0 and os.path.isfile(_chunk_pdf(book_dir, cid)),
+            'secs': time.time() - t0, 'out': out,
             'pdf': _chunk_pdf(book_dir, cid), 'synctex': _chunk_sync(book_dir, cid)}
 
 
@@ -1631,13 +1804,17 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     hashes = [_chunk_hash(doc['preamble'], c) for c in chunks]
     cache = read_cache(book_dir) or {}
     cached = cache.get('chunks') if isinstance(cache.get('chunks'), list) else []
+    cached_by_id = {
+        c.get('id'): c for c in cached if isinstance(c, dict) and c.get('id')
+    }
     labels_now = _agg_labels(book_dir)       # 上一次编译产出的跨块标签
     xrefs = [_xref_sig(c['text'], labels_now) for c in chunks]
 
-    texcmd = 'xelatex'                      # 优先 PATH 解析（绝对路径在本机实测慢得多）
     texdir = os.path.dirname(tex) if tex else ''
     xelatex_alt = os.path.join(texdir, 'xelatex.exe') if texdir else ''
     xdvipdfmx_alt = os.path.join(texdir, 'xdvipdfmx.exe') if texdir else ''
+    texcmd = (tex if (tex and os.path.isfile(tex))
+              else (xelatex_alt if (xelatex_alt and os.path.isfile(xelatex_alt)) else 'xelatex'))
 
     t0 = time.time()
     # 探测是否启用页码解耦架构（kit 仅在导言区变化时编译 1 次 ~1.3s，之后 <1ms 命中缓存）
@@ -1656,8 +1833,8 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     def chunk_ok(i):
         if not cache_mode_ok:
             return False
-        c = cached[i] if i < len(cached) else {}
         cid = chunks[i]['id']
+        c = cached_by_id.get(cid) or {}
         built = c.get('built')
         hash_ok = (built == hashes[i]
                    or (built is not None
@@ -1703,7 +1880,7 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     front_pages = int(cache.get('front') or 0)
     starts = []
     for i in range(n):
-        c = cached[i] if i < len(cached) else {}
+        c = cached_by_id.get(chunks[i]['id']) or {}
         st = c.get('start')
         starts.append(st if isinstance(st, int) and st > 0 else 1)
     if any(s == 1 for s in starts):
@@ -1717,7 +1894,7 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     base_pages = []
     for i in range(n):
         if decoupled:
-            c = cached[i] if (cache_mode_ok and i < len(cached)) else {}
+            c = cached_by_id.get(chunks[i]['id']) or {}
             if i not in changed and isinstance(c.get('base_page'), int) and c['base_page'] >= 1:
                 base_pages.append(c['base_page'])
             elif _has_intra_pageref(chunks[i]['text']):
@@ -1727,11 +1904,22 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
         else:
             base_pages.append(starts[i])
 
-    # 预刷新聚合 aux，供本轮编译的跨块 \ref / \pageref 读到最新标签与绝对页码
+    # Rust 原生预处理：单次并发扫描/缓存 image/ 物理尺寸、升级旧 .dp，并刷新聚合 main.aux
     init_deltas = ({chunks[i]['id']: starts[i] - base_pages[i] for i in range(n)}
                    if decoupled else None)
-    _agg_aux(book_dir, [c['id'] for c in chunks], deltas=init_deltas,
-             include_front=bool(front_pages and decoupled))
+    prep_res = pdf_stamp.run_native_prep(
+        book_dir,
+        chunk_ids=[c['id'] for c in chunks],
+        deltas=init_deltas,
+        include_front=bool(front_pages and decoupled),
+        write_agg_aux=True,
+        scan_images=True,
+        upgrade_tikz_dp=True,
+    )
+    image_dims = (prep_res or {}).get('images')
+    if prep_res is None:
+        _agg_aux(book_dir, [c['id'] for c in chunks], deltas=init_deltas,
+                 include_front=bool(front_pages and decoupled))
 
     def inject_of(i, start_page):
         # article 类（ctexart）没有 chapter/part 计数器：无条件 \setcounter 会在
@@ -1776,6 +1964,43 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
             s += sm
         return s
 
+    _SETCOUNTER_RE = re.compile(r'\\setcounter\{([A-Za-z@]+)\}\{(-?\d+)\}')
+
+    def counter_deltas_of(i):
+        cid = chunks[i]['id']
+        c = cached_by_id.get(cid) or {}
+        old_cnts = c.get('counters')
+        old_chap = c.get('chapter')
+        if not isinstance(old_cnts, dict) or not isinstance(old_chap, int):
+            old_cnts = {}
+            old_chap = None
+            try:
+                with open(os.path.join(_chunk_dir(book_dir, cid), 'wrapper.tex'),
+                          encoding='utf-8', errors='replace') as wf:
+                    for ln in wf:
+                        if ln.startswith('\\AddToHook{begindocument/end}'):
+                            for mc in _SETCOUNTER_RE.finditer(ln):
+                                k, v = mc.group(1), int(mc.group(2))
+                                if k == 'chapter':
+                                    old_chap = v
+                                elif k != 'page':
+                                    old_cnts[k] = v
+                            break
+            except OSError:
+                return {}
+            if old_chap is None:
+                return {}
+        new_cnts = chunks[i].get('counters') or {}
+        deltas_map = {}
+        if chapter_no[i] != old_chap:
+            deltas_map['chapter'] = chapter_no[i] - old_chap
+        for name in _COUNTERS + _THEOREM_COUNTERS:
+            nv = int(new_cnts.get(name) or 0)
+            ov = int(old_cnts.get(name) or 0)
+            if nv != ov:
+                deltas_map[name] = nv - ov
+        return deltas_map
+
     def uses_lastpage(*texts):
         """书稿是否用 lastpage（`\\pageref{LastPage}` 之类）。
 
@@ -1792,19 +2017,69 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
                                   ignore_abspage=not uses_lastpage(doc['preamble'],
                                                                    chunks[i]['text']),
                                   decoupled=decoupled,
-                                  on_xelatex_done=on_xelatex_done)
+                                  on_xelatex_done=on_xelatex_done,
+                                  image_dims=image_dims,
+                                  counter_deltas=counter_deltas_of(i))
         except Exception as ex:             # noqa: BLE001
             return {'ok': False, 'out': str(ex), 'pdf': '', 'synctex': '', 'secs': 0}
 
     def compile_chunks(todo_list, page_list, on_xelatex_done=None):
         if not todo_list:
             return []
-        procs = []
-        sem = threading.Semaphore(MAX_PARALLEL)
         for i in todo_list:
             if log_cb:
                 log_cb('[并行编译] %s（%s %d）' % (
                     chunks[i]['id'], '基准页' if decoupled else '起始页', page_list[i]))
+        if pdf_stamp.find_native_merger():
+            jobs = []
+            prep_errs = []
+            for i in todo_list:
+                try:
+                    cdeltas = counter_deltas_of(i)
+                    jobs.append(_prepare_piece_job(
+                        book_dir, chunks[i]['id'], doc['preamble'],
+                        chunks[i]['text'], inject_of(i, page_list[i]), env,
+                        texcmd, xelatex_alt, xdvipdfmx_alt,
+                        single_pass=(not decoupled and i not in changed),
+                        ignore_abspage=not uses_lastpage(doc['preamble'], chunks[i]['text']),
+                        decoupled=decoupled,
+                        image_dims=image_dims,
+                        counter_deltas=cdeltas,
+                    ))
+                except Exception as ex:     # noqa: BLE001
+                    prep_errs.append((chunks[i]['id'], str(ex)))
+            if prep_errs:
+                return prep_errs
+            xe_bin, xdv_bin, is_miktex = _resolve_portable_bins(texcmd, xelatex_alt, xdvipdfmx_alt)
+            nb = pdf_stamp.run_native_batch(
+                {
+                    'book_dir': book_dir,
+                    'xelatex': xe_bin,
+                    'xdvipdfmx': xdv_bin,
+                    'is_miktex': is_miktex,
+                    'max_parallel': MAX_PARALLEL,
+                    'timeout_secs': 420,
+                    'stream_events': bool(on_xelatex_done is not None),
+                    'env': {str(k): str(v) for k, v in (env or {}).items()},
+                    'jobs': jobs,
+                },
+                on_xelatex_done=on_xelatex_done,
+                timeout=480,
+            )
+            if nb is not None and isinstance(nb.get('results'), list):
+                by_cid = {r.get('cid'): r for r in nb['results'] if isinstance(r, dict)}
+                errs = []
+                for i in todo_list:
+                    cid = chunks[i]['id']
+                    r = by_cid.get(cid) or {'ok': False, 'out': '[并行编译] 无结果', 'pdf': ''}
+                    pdf_p = r.get('pdf') or _chunk_pdf(book_dir, cid)
+                    if not r.get('ok') or not os.path.isfile(pdf_p):
+                        errs.append((cid, r.get('out') or ''))
+                return errs
+
+        procs = []
+        sem = threading.Semaphore(MAX_PARALLEL)
+        for i in todo_list:
             box = {}
 
             def work(ii=i, oo=page_list[i], bx=box, sm=sem):
@@ -1850,8 +2125,12 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     def format_race(errs):
         """是否是「多个 xelatex 同时重建/抢占 xelatex.fmt」导致的启动级失败。"""
         for _, out in errs:
-            s = out or ''
-            if 'did not succeed' in s or 'Permission denied' in s or 'xelatex.fmt' in s:
+            s = (out or '').lower()
+            if ('cannot find the format file' in s
+                    or 'memory dump file could not be found' in s
+                    or "i'm stymied" in s
+                    or 'initexmf' in s
+                    or ('permission denied' in s and '.fmt' in s)):
                 return True
         return False
 
@@ -1904,7 +2183,8 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
                                '\\setcounter{page}{1}', env,
                                texcmd, xelatex_alt, xdvipdfmx_alt, toc_seed=toc_text,
                                ignore_abspage=not uses_lastpage(doc['preamble'], doc['front']),
-                               decoupled=decoupled)
+                               decoupled=decoupled,
+                               image_dims=image_dims)
         except Exception as ex:             # noqa: BLE001
             return {'ok': False, 'out': str(ex)}
         if r.get('ok'):
@@ -2253,13 +2533,14 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
     total_pages = 0
     try:
         if decoupled and pdf_stamp.find_native_merger():
-            sync_hit = _synctex_cache_hit(items, sync_tmp)
+            can_native_sync = (_merge_synctex is _ORIG_MERGE_SYNCTEX)
+            sync_hit = can_native_sync and _synctex_cache_hit(items, sync_tmp)
             if sync_hit:
                 sync_done = True
                 res = pdf_stamp.run_native_merge(
                     pdf_args=(parts, merged, kit_info, outline, toc_pages, label_pages)
                 )
-            elif _ensure_slim_items(items):
+            elif can_native_sync and _ensure_slim_items(items):
                 res = pdf_stamp.run_native_merge(
                     pdf_args=(parts, merged, kit_info, outline, toc_pages, label_pages),
                     synctex_args=(items, sync_tmp),
@@ -2315,7 +2596,8 @@ def try_compile(book_dir, book_name, tex, env, log_cb=None):
 
     newcache = [{'id': chunks[i]['id'], 'hash': hashes[i], 'built': hashes[i],
                  'xref': xrefs[i], 'pages': pages[i], 'start': starts[i],
-                 'base_page': base_pages[i]} for i in range(n)]
+                 'base_page': base_pages[i], 'chapter': chapter_no[i],
+                 'counters': chunks[i].get('counters') or {}} for i in range(n)]
     cache_rec = {
         'front': front_pages,
         'chunks': newcache,

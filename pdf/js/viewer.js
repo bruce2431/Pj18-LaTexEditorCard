@@ -68,22 +68,55 @@
     } catch (e) { /* 服务器不可达：保持空态 */ }
   }
 
+  /* ---------------- 页码持久化（跨重载/重开恢复） ---------------- */
+  const PAGE_KEY = 'florialatex.pages.v1';
+  function readPageMap() {
+    try {
+      const raw = localStorage.getItem(PAGE_KEY);
+      const obj = raw ? JSON.parse(raw) : null;
+      return (obj && typeof obj === 'object') ? obj : {};
+    } catch (e) { return {}; }
+  }
+  function readSavedPage(book) {
+    if (!book) return 0;
+    const n = parseInt(readPageMap()[book], 10);
+    return Number.isFinite(n) && n >= 1 ? n : 0;
+  }
+  function savePage(book, page) {
+    if (!book || !Number.isFinite(page) || page < 1) return;
+    try {
+      const map = readPageMap();
+      if (map[book] === page) return;
+      map[book] = page;
+      const keys = Object.keys(map);
+      if (keys.length > 50) delete map[keys[0]];
+      localStorage.setItem(PAGE_KEY, JSON.stringify(map));
+    } catch (e) { /* 隐私模式/配额满：忽略 */ }
+  }
+
   /* ---------------- PDF 载入 ---------------- */
   // soft=true：打开书稿时的「只读本地 PDF」路径——载不到不算编译失败，只回落成未编译态
-  // keep=true：重载（编译后 / 外部编译轮询命中）——载完停在重载前那一页
+  // keep=true（保持重载前当前页）或正整数（跳到指定页/恢复上次记忆页）
   function loadPdf(soft, keep) {
     if (!window.PdfView) return Promise.resolve();
+    const book = S.book;
     const v = S.pdfMtime || Date.now();
     // API 基准在 <base>/api/（卡片在 <base>/<cardId>/ 下），不能直接用相对地址
-    return PdfView.load(F.apiUrl('api/pdf?book=' + encodeURIComponent(S.book) + '&v=' + v), (cur, total) => {
+    return PdfView.load(F.apiUrl('api/pdf?book=' + encodeURIComponent(book) + '&v=' + v), (cur, total) => {
+      if (S.book !== book) return;
       $('pdf-page-ind').textContent = cur + ' / ' + total;
+      savePage(book, cur);
       F.toc.mark();                // 目录抽屉开着时，高亮跟着翻页走
       emitState();                 // 翻页 = 状态变化（emitState 自带去重）
     }, onPick, keep).then(() => {
+      if (S.book !== book) return;
       F.compile.setState('ok');
       if (F.toc.isOpen()) F.toc.render();  // 换书/重编后书签要重读
     }).catch(err => {
+      if (S.book !== book) return;
       if (soft) {
+        PdfView.destroy();
+        $('pdf-page-ind').textContent = '– / –';
         F.compile.setState('none');
         F.toast('这篇还没有编译好的 PDF（main.pdf）——点「编译」生成');
       } else {
@@ -133,9 +166,9 @@
     B.onCmd('open', d => {                       // {book, page?} 打开书稿（可顺带跳到某页）
       const name = String(d.book || '');
       if (!name) throw new Error('open 缺少 book');
-      return open(name).then(() => {
-        const n = parseInt(d.page, 10);
-        if (Number.isFinite(n) && window.PdfView) PdfView.goTo(n);
+      const n = parseInt(d.page, 10);
+      const pg = Number.isFinite(n) && n >= 1 ? n : 0;
+      return open(name, pg).then(() => {
         emitState();
         return name;
       });
@@ -195,10 +228,16 @@
   }
 
   /* ---------------- 打开 / 关闭书稿 ---------------- */
-  async function open(name) {
+  let openSeq = 0;
+  async function open(name, targetPage) {
     name = String(name || '');
     if (!name) { close(); return; }                 // 空名 = 回到空态
-    if (S.book === name) return;                     // 已是当前篇：幂等
+    const wantPg = Number.isFinite(targetPage) && targetPage >= 1 ? Math.floor(targetPage) : 0;
+    if (S.book === name) {                           // 已是当前篇：幂等（指定页码则顺带跳页）
+      if (wantPg && window.PdfView) PdfView.goTo(wantPg);
+      return;
+    }
+    const mySeq = ++openSeq;
     S.book = name;
     S.texName = '';
     try { localStorage.setItem('florialatex.lastbook', name); } catch (e) { /* 隐私模式：忽略 */ }
@@ -210,16 +249,23 @@
     let info = null;
     try {
       const books = await F.api('api/books');
+      if (mySeq !== openSeq) return;
       const b0 = books.find(b => b.name === name) || {};
       info = b0.pdf || null;
       if (b0.texName) S.texName = b0.texName;
     } catch (e) { /* 状态取不到：只当没 PDF */ }
+    if (mySeq !== openSeq) return;
     if (info && info.exists) {
       S.pdfMtime = info.mtime || 0;         // 轮询据此判「外部编译产出新 PDF」
-      await loadPdf(true);
+      const initPg = wantPg || readSavedPage(name);
+      await loadPdf(true, initPg || false);
+      if (mySeq !== openSeq) return;
       if (!info.fresh) F.compile.setState('stale');   // 源码比 PDF 新 → 「重新编译」
     } else {
       S.pdfMtime = 0;
+      if (window.PdfView) PdfView.destroy();
+      $('pdf-pages').innerHTML = '';
+      $('pdf-page-ind').textContent = '– / –';
       F.compile.setState('none');
       if (info) F.toast('这篇还没有编译好的 PDF（main.pdf）——点「编译」生成');
     }
@@ -230,21 +276,32 @@
      会话里 AI 编译（不经前端）或手工编译 → 轮询 /api/books 比对 pdf.mtime，变了就重载。 */
   const POLL_MS = 4000;
   let watcher = null;
+  let polling = false;
   async function pollOnce() {
-    if (!S.book || S.busy) return;
-    let info = null;
+    if (!S.book || S.busy || polling || document.hidden) return;
+    const book = S.book;
+    polling = true;
     try {
-      const books = await F.api('api/books');
-      info = (books.find(b => b.name === S.book) || {}).pdf || null;
-    } catch (e) { return; }
-    if (!info || !info.exists) return;
-    if (info.mtime && info.mtime !== S.pdfMtime) {
-      S.pdfMtime = info.mtime;
-      await loadPdf(false, true);           // 外部编译产出新 PDF → 换新，停在当前页
-      F.toast('检测到新编译的 PDF，已刷新');
-      emitState();
+      let info = null;
+      try {
+        const books = await F.api('api/books');
+        info = (books.find(b => b.name === book) || {}).pdf || null;
+      } catch (e) { return; }
+      if (S.book !== book || S.busy || !info || !info.exists) return;
+      if (info.mtime && info.mtime !== S.pdfMtime) {
+        S.pdfMtime = info.mtime;
+        await loadPdf(false, true);           // 外部编译产出新 PDF → 换新，停在当前页
+        if (S.book !== book) return;
+        F.toast('检测到新编译的 PDF，已刷新');
+        emitState();
+      }
+    } finally {
+      polling = false;
     }
   }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && S.book && !S.busy) pollOnce();
+  });
   function startWatch() {
     stopWatch();
     if (!S.book) return;
@@ -253,6 +310,7 @@
   function stopWatch() { if (watcher) { clearInterval(watcher); watcher = null; } }
 
   function close() {
+    openSeq++;
     stopWatch();
     S.book = '';
     S.texName = '';
@@ -263,6 +321,16 @@
     applyToolTab('');
     F.toc.act(false);
     showEmpty(true);
+  }
+
+  /* ---------------- 标记（临时高亮笔） ---------------- */
+  function annotActive() {
+    return !!(window.PdfView && PdfView.annotOn());
+  }
+  function setAnnot(on) {
+    if (window.PdfView) PdfView.setAnnot(on);
+    $('annot-toggle').classList.toggle('on', !!on);
+    if (!on) $('annot-panel').classList.add('hidden');
   }
 
   /* ---------------- 缩放 ---------------- */
@@ -291,6 +359,7 @@
     document.addEventListener('keydown', e => {
       if (e.key !== 'Escape') return;
       if (F.toc.isOpen()) { F.toc.act(false); return; }   // 目录抽屉在最上层，先收它
+      if (annotActive()) { setAnnot(false); return; }     // 标记模式：Esc 收笔
       if (!$('side-card').classList.contains('hidden')) applyToolTab('');
     });
 
@@ -303,6 +372,29 @@
       if (!b || !n || !window.PdfView) return;
       PdfView.goTo(n);
       F.toc.mark();
+    });
+
+    /* 标记（临时高亮笔）：按钮开/关标记模式；面板选色、清空。笔画不落盘，重编即空。 */
+    $('annot-toggle').addEventListener('click', e => {
+      e.stopPropagation();
+      if (annotActive()) { setAnnot(false); $('annot-panel').classList.add('hidden'); return; }
+      setAnnot(true);
+      $('annot-panel').classList.remove('hidden');
+    });
+    document.addEventListener('click', e => {
+      if (!e.target.closest('#annot-panel') && !e.target.closest('#annot-toggle')) {
+        $('annot-panel').classList.add('hidden');
+      }
+    });
+    document.querySelectorAll('#annot-panel .ap-color').forEach(b => {
+      b.addEventListener('click', () => {
+        document.querySelectorAll('#annot-panel .ap-color').forEach(x => x.classList.toggle('on', x === b));
+        if (window.PdfView) PdfView.setPen(b.dataset.color);
+        setAnnot(true);                       // 选色即进入标记模式（Edge 同款）
+      });
+    });
+    $('annot-clear').addEventListener('click', () => {
+      if (window.PdfView) PdfView.clearAnnot();
     });
 
     $('v-compile').addEventListener('click', F.compile.compile);
